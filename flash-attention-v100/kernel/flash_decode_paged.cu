@@ -383,8 +383,16 @@ __global__ void flash_attention_decode_reduce_kernel(
   for (int d = threadIdx.x; d < D; d += blockDim.x) {
     float acc = 0.f;
     for (int i = 0; i < num_partitions; ++i) {
+      const float w = weight_shared[i];
+      // Sliding-window-masked / empty partitions set exp_sums (hence weight) to
+      // exactly 0 and never write their tmp_out slot, which therefore holds
+      // uninitialized (possibly NaN) workspace memory. fmaf(0, NaN, acc) = NaN
+      // would corrupt the whole head, so skip zero-weight partitions entirely.
+      if (w == 0.f) {
+        continue;
+      }
       acc = fmaf(
-          weight_shared[i],
+          w,
           __half2float(tmp_out[tmp_out_base + static_cast<int64_t>(i) * tmp_out_stride2 + d]),
           acc);
     }

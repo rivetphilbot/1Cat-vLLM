@@ -1054,6 +1054,11 @@ class Gemma4ForConditionalGeneration(
                 tower_quant,
                 prefix=maybe_prefix(prefix, "vision_tower"),
             )
+            # SM70/fp16 fix: the unquantized vision encoder overflows fp16
+            # (-> NaN logits). Run the tower in fp32; image/video forwards
+            # feed fp32 inputs and outputs are cast back to model_dtype at
+            # the projection boundary (flat_valid_states.to(self.model_dtype)).
+            self.vision_tower = self.vision_tower.float()
 
         # ---- Audio tower (variants with audio_config) ----
         if config.audio_config is not None:
@@ -1075,6 +1080,11 @@ class Gemma4ForConditionalGeneration(
                     tower_quant,
                     prefix=maybe_prefix(prefix, "audio_tower"),
                 )
+                # SM70/fp16 fix (same as vision tower): run the audio tower in
+                # fp32 to avoid the bf16-vs-fp16 dtype mismatch and fp16
+                # overflow. Inputs are cast to fp32 and outputs back to
+                # model_dtype in _process_audio_input.
+                self.audio_tower = self.audio_tower.float()
         else:
             self.audio_tower = None
             self.embed_audio = None
@@ -1299,10 +1309,10 @@ class Gemma4ForConditionalGeneration(
                 pad_tensor = (pp_tensor == -1).all(dim=-1)
 
                 inputs_embeds = vt.patch_embedder(
-                    pv_tensor,
+                    pv_tensor.to(torch.float32),
                     pp_tensor,
                     pad_tensor,
-                ).to(self.model_dtype)
+                ).to(torch.float32)
                 encoder_outputs = vt.encoder(
                     inputs_embeds=inputs_embeds,
                     attention_mask=~pad_tensor,
@@ -1408,10 +1418,10 @@ class Gemma4ForConditionalGeneration(
             pad_chunk = padding_positions[i : i + max_batch_size]
 
             inputs_embeds = vt.patch_embedder(
-                pv_chunk,
+                pv_chunk.to(torch.float32),
                 pp_chunk,
                 pad_chunk,
-            ).to(self.model_dtype)
+            ).to(torch.float32)
             encoder_outputs = vt.encoder(
                 inputs_embeds=inputs_embeds,
                 attention_mask=~pad_chunk,
@@ -1477,15 +1487,20 @@ class Gemma4ForConditionalGeneration(
         input_features_mask = audio_input["input_features_mask"].squeeze(1)
 
         # Run audio tower — mask convention: True=valid, False=padding.
-        audio_outputs = self.audio_tower(input_features, input_features_mask)
+        # fp32 tower (SM70/fp16 fix): feed fp32 features.
+        audio_outputs = self.audio_tower(
+            input_features.to(torch.float32), input_features_mask
+        )
         if isinstance(audio_outputs, tuple):
             audio_encodings, audio_mask = audio_outputs
         else:
             audio_encodings = audio_outputs.last_hidden_state
             audio_mask = audio_outputs.attention_mask
 
-        # Project into LM embedding space.
-        audio_features = self.embed_audio(inputs_embeds=audio_encodings)
+        # Project into LM embedding space (cast back to model dtype first).
+        audio_features = self.embed_audio(
+            inputs_embeds=audio_encodings.to(self.model_dtype)
+        )
 
         # Strip padding per-batch element: only keep valid (non-padding)
         # tokens.

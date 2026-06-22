@@ -40,7 +40,7 @@ def get_ext_modules():
                     "-U__CUDA_NO_HALF2_OPERATORS__",
                     "--expt-relaxed-constexpr",
                     "--expt-extended-lambda",
-                    "--use_fast_math",
+                    
                 ],
             },
         ),
@@ -57,7 +57,7 @@ def get_ext_modules():
                     "-U__CUDA_NO_HALF_OPERATORS__",
                     "-U__CUDA_NO_HALF_CONVERSIONS__",
                     "-U__CUDA_NO_HALF2_OPERATORS__",
-                    "--use_fast_math",
+                    
                 ],
             },
         )

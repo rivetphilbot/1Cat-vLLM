@@ -27,6 +27,7 @@ _flash_attn_func = None
 _flash_attn_decode_paged = None
 _flash_attn_prefill_paged = None
 _paged_kv_utils = None
+_flash_v100_dumped_decode_nan = False
 _warned_prefill_fallback = False
 _warned_feature_fallback = False
 _warned_decode_fallback = False
@@ -35,6 +36,19 @@ _logged_prefill_prefix_flash = False
 _logged_prefill_smallq_decode = False
 _logged_decode_flash = False
 _logged_prefill_compare = False
+_warned_paged_prefill_smem = False
+
+# V100 dynamic shared-memory ceiling (bytes).
+_FLASH_V100_MAX_SMEM = 98304
+
+# Base (block-table-independent) shared memory of the PAGED prefill kernel,
+# per head_dim, mirroring KernelConfig<D>::TOTAL_SMEM in
+# flash-attention-v100/kernel/fused_mha_forward_paged.cu. The kernel ALSO
+# stores the per-sequence block table in smem (extra = align128(max_num_blocks
+# * 4)), so total smem grows with max_model_len / page_block_size. These bases
+# are already ~84-96KB, leaving little headroom: long-context servers overflow
+# the 96KB ceiling and must fall back to the gather+dense prefill path.
+_PAGED_PREFILL_BASE_SMEM = {64: 81408, 128: 97792, 256: 93952, 512: 85888}
 
 
 def _get_flash_ops():
@@ -110,6 +124,34 @@ def _extract_contiguous_kv_from_paged_cache(
                 f"Unexpected KV cache shape {tuple(kv_cache.shape)}; "
                 "expected dimension 2 at axis 0 or 1"
             )
+    # unbind() of the interleaved K/V cache is non-contiguous; the gather
+    # kernel mis-reads the stride. Force contiguous before extraction.
+    if not isinstance(kv_cache, (list, tuple)):
+        key_cache = key_cache.contiguous()
+        value_cache = value_cache.contiguous()
+
+    # DIAGNOSTIC: force the pure-PyTorch gather (correct by construction) to
+    # test whether the CUDA paged_kv_to_contiguous kernel is producing wrong KV.
+    if os.getenv("VLLM_FLASH_V100_FORCE_PY_GATHER", "0") == "1":
+        paged_kv_utils = None
+
+    # fp8 (uint8) caches: the CUDA gather kernel is typed for fp16, but a
+    # gather is a bitwise copy — view 2 uint8 bytes as one fake half, run the
+    # fast kernel, view the result back. Avoids the very slow per-block Python
+    # loop (the dominant chunked-prefill cost for fp8-KV models like deckard).
+    if (paged_kv_utils is not None and key_cache.dtype == torch.uint8
+            and head_dim % 2 == 0
+            and os.getenv("VLLM_FLASH_V100_NO_U8_GATHER", "0") != "1"
+            and hasattr(paged_kv_utils, "paged_kv_to_contiguous")):
+        kc_h = key_cache.view(torch.float16)    # [..., head_dim//2] halfs
+        vc_h = value_cache.view(torch.float16)
+        k_h, v_h = paged_kv_utils.paged_kv_to_contiguous(
+            kc_h, vc_h, block_table, seq_lens)
+        if total_tokens is None:
+            total_tokens = int(seq_lens.sum().item())
+        k_cont = k_h.view(torch.uint8).view(-1, num_kv_heads, head_dim)
+        v_cont = v_h.view(torch.uint8).view(-1, num_kv_heads, head_dim)
+        return k_cont[:total_tokens], v_cont[:total_tokens]
 
     if paged_kv_utils is not None and key_cache.dtype != torch.uint8:
         if hasattr(paged_kv_utils, "paged_kv_to_contiguous"):
@@ -122,6 +164,36 @@ def _extract_contiguous_kv_from_paged_cache(
                                                         seq_lens)
         if total_tokens is None:
             total_tokens = int(seq_lens.sum().item())
+        if os.getenv("VLLM_FLASH_V100_GATHER_COMPARE", "0") == "1":
+            import sys
+            bs = block_table.shape[0]
+            tt = total_tokens
+            kp = torch.empty((tt, num_kv_heads, head_dim),
+                             dtype=key_cache.dtype, device=key_cache.device)
+            off = 0
+            for bi in range(bs):
+                sl_ = int(seq_lens[bi].item())
+                nb = (sl_ + block_size - 1) // block_size
+                for blk in range(nb):
+                    pb = int(block_table[bi, blk].item())
+                    st = blk * block_size
+                    en = min(st + block_size, sl_)
+                    n = en - st
+                    if off + n > tt:
+                        n = tt - off
+                    if n <= 0:
+                        break
+                    kp[off:off + n] = key_cache[pb, :n]
+                    off += n
+            kc_cuda = k_cont[:tt]
+            diff = (kc_cuda.float() - kp.float()).abs()
+            perpos = diff.reshape(tt, -1).max(dim=1).values
+            nbad = int((perpos > 1e-3).sum())
+            bad_first = (perpos > 1e-3).nonzero().flatten()[:5].tolist()
+            print(f"GATHER_COMPARE tt={tt} seqlens={seq_lens[:3].tolist()} "
+                  f"maxdiff={float(diff.max()):.4f} nbad={nbad}/{tt} "
+                  f"firstbad={bad_first} cuda_nan={int(torch.isnan(kc_cuda).sum())}",
+                  file=sys.stderr, flush=True)
         return k_cont[:total_tokens], v_cont[:total_tokens]
 
     # Slow Python fallback.
@@ -537,12 +609,40 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                         )
                     _logged_prefill_prefix_flash = True
                 self._reset_decode_cache()
+                if os.getenv("VLLM_FLASH_V100_TRACE", "0") == "1":
+                    _ln = getattr(layer, "layer_name", "?")
+                    _qn = int(torch.isnan(query).sum().item())
+                    _kn = int(torch.isnan(key).sum().item()) if key is not None else -1
+                    _vn = int(torch.isnan(value).sum().item()) if value is not None else -1
+                    _out = self._flash_v100_prefill_with_prefix(
+                        layer, query, kv_cache, attn_metadata, output)
+                    _on = int(torch.isnan(_out).sum().item())
+                    if _qn or _kn > 0 or _vn > 0 or _on:
+                        logger.warning(
+                            "TRACE prefix-prefill layer=%s win=%s qnan=%d knan=%d "
+                            "vnan=%d outnan=%d qshape=%s",
+                            _ln, str(self._flash_window), _qn, _kn, _vn, _on,
+                            tuple(query.shape),
+                        )
+                    return _out
                 return self._flash_v100_prefill_with_prefix(
                     layer,
                     query,
                     kv_cache,
                     attn_metadata,
                     output,
+                )
+            if getattr(self, "kv_sharing_target_layer_name", None) is not None:
+                # KV-shared layer (gemma E2B/E4B): it applies RoPE to Q only and
+                # passes raw, un-normed/un-RoPE'd K/V; the real K/V live in the
+                # TARGET layer's cache, aliased into kv_cache and already written
+                # by that earlier layer this forward pass. Read them via the
+                # prefix path (paged kernel when smem-safe, else gather+dense)
+                # instead of the dense passed-K/V path, which would attend to
+                # junk. (Decode already reads kv_cache directly.)
+                self._reset_decode_cache()
+                return self._flash_v100_prefill_with_prefix(
+                    layer, query, kv_cache, attn_metadata, output
                 )
             if not flash_prefill_ok:
                 # 512-dim no-prefix prefill: dense kernel caps at 256 -> Triton.
@@ -695,6 +795,35 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             v_scale=float(layer._v_scale_float),
             window=self._flash_window,
         )
+        if os.getenv("VLLM_FLASH_V100_NAN_DEBUG", "0") == "1":
+            import sys
+            qn = int(torch.isnan(query).sum())
+            kn = int(torch.isnan(key_cache).sum())
+            on = int(torch.isnan(out_view).sum())
+            sl = attn_metadata.seq_lens
+            print(f"DECODE qnan={qn} kcache_nan={kn} out_nan={on} "
+                  f"seq_lens={sl[:3].tolist()} win={self._flash_window} "
+                  f"qshape={list(query.shape)}", file=sys.stderr, flush=True)
+            global _flash_v100_dumped_decode_nan
+            if (on > 0 and qn == 0 and kn == 0
+                    and not _flash_v100_dumped_decode_nan
+                    and os.getenv("VLLM_FLASH_V100_DUMP_DECODE_NAN", "0") == "1"):
+                dp = f"/home/jarvis/builds/decode_nan_dump.pt"
+                torch.save({
+                    "query": query.detach().cpu(),
+                    "key_cache": key_cache.detach().cpu(),
+                    "value_cache": value_cache.detach().cpu(),
+                    "block_table": attn_metadata.block_table.detach().cpu(),
+                    "seq_lens": attn_metadata.seq_lens.detach().cpu(),
+                    "scale": float(self.scale),
+                    "window": int(self._flash_window),
+                    "k_scale": float(layer._k_scale_float),
+                    "v_scale": float(layer._v_scale_float),
+                    "kv_cache_dtype": self.kv_cache_dtype,
+                    "out_nan": on,
+                }, dp)
+                print(f"DECODE_NAN_DUMP saved {dp}", file=sys.stderr, flush=True)
+                _flash_v100_dumped_decode_nan = True
         return output
 
     def _flash_v100_small_query_prefill_as_decode(
@@ -801,6 +930,71 @@ class FlashAttnV100Impl(TritonAttentionImpl):
         )
         return output
 
+    def _paged_prefill_smem_fits(
+        self,
+        attn_metadata: TritonAttentionMetadata,
+    ) -> bool:
+        """Whether the paged prefill kernel's smem fits V100's 96KB ceiling.
+
+        The kernel copies the per-sequence block table into shared memory, so
+        smem = TOTAL_SMEM[head_dim] + align128(max_num_blocks * 4). For long
+        max_model_len the block table alone blows the budget (e.g. head_dim 256
+        at 177k ctx needs ~135KB). When it does not fit, the caller uses the
+        gather + dense prefill path, which is smem-safe at any context length.
+        """
+        base = _PAGED_PREFILL_BASE_SMEM.get(self.head_size)
+        if base is None:
+            return False
+        block_table = getattr(attn_metadata, "block_table", None)
+        if block_table is None or block_table.ndim < 2:
+            return False
+        max_num_blocks = int(block_table.shape[1])
+        extra = (max_num_blocks * 4 + 127) & ~127
+        return base + extra <= _FLASH_V100_MAX_SMEM
+
+    def _py_dense_prefix_attn(self, q_seq, k_cont, v_cont, k_len, q_len,
+                              causal):
+        """Pure-PyTorch dense attention for prefix/chunked prefill.
+
+        Bypasses the FA_V100 prefill kernels (which mis-handle this shape on
+        SM70). q_seq:(q_len, nq, d); k/v_cont:(k_len, nkv, d). The query is the
+        SUFFIX of the sequence: query row i is at absolute position
+        (k_len - q_len + i). Builds a causal + sliding-window mask in fp32.
+        """
+        nq = q_seq.shape[-2]
+        nkv = k_cont.shape[-2]
+        device = q_seq.device
+        q = q_seq.to(torch.float32).transpose(0, 1).unsqueeze(0)   # (1,nq,q_len,d)
+        k = k_cont.to(torch.float32).transpose(0, 1).unsqueeze(0)  # (1,nkv,k_len,d)
+        v = v_cont.to(torch.float32).transpose(0, 1).unsqueeze(0)
+        if nq != nkv and nkv > 0:
+            rep = nq // nkv
+            k = k.repeat_interleave(rep, dim=1)
+            v = v.repeat_interleave(rep, dim=1)
+        qpos = torch.arange(k_len - q_len, k_len, device=device).unsqueeze(1)
+        kpos = torch.arange(k_len, device=device).unsqueeze(0)
+        allowed = torch.ones((q_len, k_len), dtype=torch.bool, device=device)
+        if causal:
+            allowed &= (kpos <= qpos)
+        win = self.sliding_window
+        if (isinstance(win, (tuple, list)) and len(win) >= 1
+                and win[0] is not None and win[0] >= 0):
+            allowed &= (kpos > qpos - (int(win[0]) + 1))
+        bias = torch.zeros((q_len, k_len), dtype=torch.float32, device=device)
+        bias.masked_fill_(~allowed, float("-inf"))
+        out = torch.nn.functional.scaled_dot_product_attention(
+            q, k, v, attn_mask=bias, scale=self.scale)            # (1,nq,q_len,d)
+        if os.getenv("VLLM_FLASH_V100_NAN_DEBUG", "0") == "1":
+            import sys
+            qn = int(torch.isnan(q).sum()); kn = int(torch.isnan(k).sum())
+            vn = int(torch.isnan(v).sum()); on = int(torch.isnan(out).sum())
+            allmasked = int((~torch.isfinite(bias)).all(dim=-1).sum())
+            if qn or kn or vn or on or allmasked:
+                print(f"PYDENSE_NAN q={qn} k={kn} v={vn} out={on} "
+                      f"fully_masked_rows={allmasked} qlen={q_len} klen={k_len} "
+                      f"win={self.sliding_window}", file=sys.stderr, flush=True)
+        return out.transpose(1, 2).to(q_seq.dtype)                # (1,q_len,nq,d)
+
     def _flash_v100_prefill_with_prefix(
         self,
         layer: torch.nn.Module,
@@ -830,11 +1024,30 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             key_cache, value_cache = kv_cache.unbind(0)
         else:
             key_cache, value_cache = kv_cache.unbind(1)
+        # unbind() yields a STRIDED (non-contiguous) view of the interleaved
+        # K/V cache (key_stride[0] = 2x contiguous). The paged-prefill kernel
+        # mis-reads that stride -> garbage chunked output (decode handles it,
+        # prefill does not). Force contiguous so the kernel sees the layout it
+        # assumes. Cost is ~hundreds of MB per layer, affordable.
+        key_cache = key_cache.contiguous()
+        value_cache = value_cache.contiguous()
         block_size = key_cache.shape[1]
         num_kv_heads = key_cache.shape[2]
         head_dim = key_cache.shape[3]
         debug_compare = (os.getenv("VLLM_FLASH_V100_DEBUG_PREFILL_COMPARE", "0")
                          == "1")
+        # The paged prefill kernel stores the block table in smem; at long
+        # max_model_len it overflows V100's 96KB. When it won't fit, use the
+        # gather + dense path below (smem-safe at any context length).
+        paged_smem_fits = self._paged_prefill_smem_fits(attn_metadata)
+        if not paged_smem_fits:
+            global _warned_paged_prefill_smem
+            if not _warned_paged_prefill_smem:
+                logger.info(
+                    "FLASH_ATTN_V100 paged prefill smem exceeds 96KB at this "
+                    "max_model_len; using gather+dense prefill (still FA)."
+                )
+                _warned_paged_prefill_smem = True
 
         query_lens = query_start_loc[1:] - query_start_loc[:-1]
         max_query_len = int(query_lens.max().item()) if num_seqs > 0 else 0
@@ -868,7 +1081,7 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             if end <= start:
                 continue
 
-            if self.use_flash_v100_prefill_paged:
+            if self.use_flash_v100_prefill_paged and paged_smem_fits:
                 out_seq = self.flash_attn_prefill_paged(
                     query[start:end].unsqueeze(0),
                     key_cache,
@@ -975,14 +1188,43 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                     float(layer._v_scale_float),
                 )
 
-                out_seq = self.flash_attn_func(
-                    query[start:end].unsqueeze(0),
-                    k_cont.unsqueeze(0),
-                    v_cont.unsqueeze(0),
-                    causal=causal,
-                    softmax_scale=self.scale,
-                    window_size=self.sliding_window,
-                )
+                q_seq = query[start:end]
+                q_len = q_seq.shape[0]
+                k_len = k_cont.shape[0]
+                if os.getenv("VLLM_FLASH_V100_PY_DENSE", "0") == "1":
+                    out_seq = self._py_dense_prefix_attn(
+                        q_seq, k_cont, v_cont, k_len, q_len, causal)
+                elif (causal and 0 < q_len < k_len
+                        and os.getenv("VLLM_FLASH_V100_NO_QPAD", "0") != "1"):
+                    # flash_attn_func has no query-offset arg; with q_len<k_len
+                    # the kernel can't tell the query is the SUFFIX of the
+                    # sequence (prefix/chunked prefill), so its causal mask is
+                    # misaligned -> wrong output. Pad the query so the real
+                    # tokens occupy the LAST q_len rows (bottom-right causal),
+                    # then drop the padded prefix from the output.
+                    pad = k_len - q_len
+                    q_pad = torch.cat(
+                        [q_seq.new_zeros((pad,) + tuple(q_seq.shape[1:])), q_seq],
+                        dim=0,
+                    )
+                    out_full = self.flash_attn_func(
+                        q_pad.unsqueeze(0),
+                        k_cont.unsqueeze(0),
+                        v_cont.unsqueeze(0),
+                        causal=True,
+                        softmax_scale=self.scale,
+                        window_size=self.sliding_window,
+                    )
+                    out_seq = out_full[:, pad:]
+                else:
+                    out_seq = self.flash_attn_func(
+                        q_seq.unsqueeze(0),
+                        k_cont.unsqueeze(0),
+                        v_cont.unsqueeze(0),
+                        causal=causal,
+                        softmax_scale=self.scale,
+                        window_size=self.sliding_window,
+                    )
             out_view[start:end].copy_(out_seq.squeeze(0))
 
         return output
