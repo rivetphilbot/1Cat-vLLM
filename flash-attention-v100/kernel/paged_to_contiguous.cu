@@ -2,6 +2,8 @@
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <torch/extension.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAStream.h>
 
 __global__ void paged_to_contiguous_stride_aware_kernel(
     const __half* __restrict__ paged_cache,
@@ -143,7 +145,12 @@ torch::Tensor paged_to_contiguous(
     );
 
     const int threads = 256;
-    paged_to_contiguous_stride_aware_kernel<<<batch_size, threads>>>(
+    // Launch on the current PyTorch stream so the gather is ordered AFTER the
+    // KV-cache write and the .contiguous() copy that feed it. Launching on the
+    // default stream (0) races with those PyTorch-stream ops -> reads stale /
+    // partially-copied cache -> wrong KV (garbage output on chunked prefill).
+    auto stream = at::cuda::getCurrentCUDAStream();
+    paged_to_contiguous_stride_aware_kernel<<<batch_size, threads, 0, stream>>>(
         reinterpret_cast<const __half*>(paged_cache.data_ptr<at::Half>()),
         block_table.data_ptr<int>(),
         seq_lens.data_ptr<int>(),
@@ -188,7 +195,10 @@ std::vector<torch::Tensor> paged_kv_to_contiguous(
     auto contiguous_value = torch::zeros({total_tokens, num_heads, head_dim}, opts);
 
     const int threads = 256;
-    paged_kv_to_contiguous_stride_aware_kernel<<<batch_size, threads>>>(
+    // Use the current PyTorch stream (see paged_to_contiguous above): the
+    // default-stream launch races with the cache write / .contiguous() copy.
+    auto stream = at::cuda::getCurrentCUDAStream();
+    paged_kv_to_contiguous_stride_aware_kernel<<<batch_size, threads, 0, stream>>>(
         reinterpret_cast<const __half*>(paged_key_cache.data_ptr<at::Half>()),
         reinterpret_cast<const __half*>(paged_value_cache.data_ptr<at::Half>()),
         block_table.data_ptr<int>(),

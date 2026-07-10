@@ -181,8 +181,15 @@ get_torch_gpu_compiler_flags(VLLM_GPU_FLAGS ${VLLM_GPU_LANG})
 #
 # Set nvcc parallelism.
 #
-if(NVCC_THREADS AND VLLM_GPU_LANG STREQUAL "CUDA")
-  list(APPEND VLLM_GPU_FLAGS "--threads=${NVCC_THREADS}")
+# --threads disabled: nvcc 12.8 internal assertion failure with libcu++ templates
+# if(NVCC_THREADS AND VLLM_GPU_LANG STREQUAL "CUDA")
+#   list(APPEND VLLM_GPU_FLAGS "--threads=${NVCC_THREADS}")
+# endif()
+
+# DISABLE_CUSPARSE_DEPRECATED: workaround for cusparse.h:3635 unterminated string
+# with CUDA 12.8 CUSPARSE_DEPRECATED macro expansion under gcc 13.
+if(VLLM_GPU_LANG STREQUAL "CUDA")
+  add_compile_definitions(DISABLE_CUSPARSE_DEPRECATED)
 endif()
 
 #

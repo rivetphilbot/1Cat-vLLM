@@ -295,7 +295,12 @@ class Gemma4MTPDecoderLayer(nn.Module):
             head_dim=head_dim,
             max_position_embeddings=config.max_position_embeddings,
             cache_config=cache_config,
-            quant_config=quant_config,
+            # bf16 drafter checkpoint carries no attn quant scales; build the
+            # draft attention unquantized (q/o_proj + MLP are already None).
+            # Inheriting the target's compressed-tensors quant here creates
+            # q/k/v scale+zero_point params the checkpoint can't fill, which
+            # fails the strict weight-init check. KV is shared (fp16) anyway.
+            quant_config=None,
             attn_logits_soft_cap=getattr(config, "attn_logit_softcapping", None),
             prefix=f"{prefix}.self_attn",
         )

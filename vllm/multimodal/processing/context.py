@@ -320,6 +320,21 @@ class InputProcessingContext:
         """
         return self.model_config.hf_image_processor_config
 
+    def get_merged_mm_kwargs(
+        self, mm_kwargs: Mapping[str, Any] | None
+    ) -> dict[str, Any]:
+        """Merge config-level ``mm_processor_kwargs`` with per-request kwargs.
+
+        Compatibility shim for PR#59 (gemma4_mm) which expects a newer
+        InputProcessingContext API. Per-request kwargs take precedence over
+        the model-config defaults. Added locally for the 1Cat-vLLM SM70 base
+        which predates this method upstream.
+        """
+        base = dict(getattr(self.model_config, "mm_processor_kwargs", None) or {})
+        if mm_kwargs:
+            base.update(mm_kwargs)
+        return base
+
     def get_mm_config(self):
         """
         Get the multimodal config of the model.

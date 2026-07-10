@@ -180,6 +180,14 @@ class CompressedTensorsConfig(QuantizationConfig):
                 return quant_method
 
         if isinstance(layer, Attention):
+            # No KV-cache quantization scheme in the checkpoint (kv_cache_scheme
+            # is None, e.g. gemma-4 W4A16): leave attention unquantized so it
+            # uses the raw --kv-cache-dtype (incl. fp8_e5m2, like AWQ/deckard)
+            # without demanding phantom k/v/q scale params. Returning the KV
+            # method unconditionally here blocks fp8_e5m2 and breaks MTP draft
+            # loading.
+            if getattr(self, "kv_cache_scheme", None) is None:
+                return None
             return CompressedTensorsKVCacheMethod(self)
         if isinstance(layer, FusedMoE):
             return CompressedTensorsMoEMethod.get_moe_method(
