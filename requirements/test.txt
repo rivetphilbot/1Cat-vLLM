@@ -264,7 +264,7 @@ geopandas==1.0.1
     # via terratorch
 gitdb==4.0.12
     # via gitpython
-gitpython==3.1.44
+gitpython==3.1.58
     # via mlflow-skinny
 google-api-core==2.24.2
     # via
