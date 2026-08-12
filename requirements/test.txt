@@ -1044,7 +1044,7 @@ sentence-transformers==5.2.0
     # via
     #   -r requirements/test.in
     #   mteb
-setuptools==77.0.3
+setuptools==83.0.0
     # via
     #   lightning-utilities
     #   pytablewriter
