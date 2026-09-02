@@ -523,7 +523,7 @@ networkx==3.2.1
     # via
     #   scikit-image
     #   torch
-nltk==3.9.1
+nltk==3.10.3
     # via rouge-score
 num2words==0.5.14
     # via -r requirements/test.in
