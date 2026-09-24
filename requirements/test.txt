@@ -321,7 +321,7 @@ hf-xet==1.1.7
     # via huggingface-hub
 hiredis==3.0.0
     # via tensorizer
-hpack==4.1.0
+hpack==4.2.0
     # via h2
 html2text==2025.4.15
     # via gpt-oss
