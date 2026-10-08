@@ -5,7 +5,9 @@
 - Routed-expert EXL3 tensors are STACKED per layer for the SM70 MoE method:
     <layer>.mlp.experts.exl3_{gate,up,down}_{trellis,suh,svh}   ([288, ...], int16 / fp16)
 - MTP layer (layers.45.*) and vision (model.visual.*) are optional (--mtp / --vision).
-usage: python repack_1cat.py <qtensors_dir> <src_model_dir> <out_dir> [--layers N] [--mtp] [--vision]
+- Input is either the converter work dir qtensors/ (one file per module) or a compiled EXL3 model dir
+  (sharded, with model.safetensors.index.json), e.g. a downloaded Hugging Face repo. Both repack identically.
+usage: python repack_1cat.py <qtensors_dir | exl3_model_dir> <src_model_dir> <out_dir> [--layers N] [--mtp] [--vision]
 """
 import sys, os, re, json, shutil, torch
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__))); import exl3_ref as R
@@ -23,16 +25,46 @@ EXP = re.compile(r"(.*\.mlp\.experts)\.(\d+)\.(gate|up|down)_proj\.(trellis|suh|
 total = 0
 layer_bits = {}
 
-def convert(path, name):
+def read_file(path):
+    def it():
+        with safe_open(path, "pt") as f:
+            for k in f.keys():
+                yield k, f.get_tensor(k)
+    return it
+
+def read_keys(root, pairs):
+    def it():
+        by_file = {}
+        for k, fn in pairs:
+            by_file.setdefault(fn, []).append(k)
+        for fn, keys in sorted(by_file.items()):
+            with safe_open(os.path.join(root, fn), "pt") as f:
+                for k in keys:
+                    yield k, f.get_tensor(k)
+    return it
+
+def module_sources(inp):
+    """[(module name, reader)]: one entry per qtensors file, or per module of a sharded EXL3 model dir."""
+    index = os.path.join(inp, "model.safetensors.index.json")
+    if not os.path.exists(index):
+        return [(fn[:-len(".safetensors")], read_file(os.path.join(inp, fn)))
+                for fn in sorted(os.listdir(inp)) if fn.endswith(".safetensors")]
+    groups = {}
+    for k, fn in json.load(open(index))["weight_map"].items():
+        m = re.match(r"(model\.language_model\.layers\.\d+)\.", k)
+        g = m.group(1) if m else ("model.visual" if k.startswith("model.visual") else "model.other")
+        groups.setdefault(g, []).append((k, fn))
+    return [(g, read_keys(inp, pairs)) for g, pairs in sorted(groups.items())]
+
+def convert(reader, name):
     global total
     dst = os.path.join(out, name)
     if os.path.exists(dst) and os.path.getsize(dst) > 0 and "--force" not in sys.argv:
         total += os.path.getsize(dst); return                  # incremental: module files are final once written
     res, bank, dq = {}, {}, {}
     is_mtp_file = bool(re.match(r"model\.language_model\.layers\.(4[5-9]|[5-9]\d)\b", name))
-    with safe_open(path, "pt") as f:
-        for k in f.keys():
-            t = f.get_tensor(k)
+    if True:
+        for k, t in reader():
             m = EXP.match(k)
             if m:
                 pre, e, proj, kind = m.group(1), int(m.group(2)), m.group(3), m.group(4)
@@ -72,23 +104,23 @@ def convert(path, name):
     if PAUSE: time.sleep(PAUSE)
     print(f"{name}: {len(res)} tensors, {nb / 2**30:.2f} GiB" + (f", {len(bank)} stacked expert tensors" if bank else ""), flush = True)
 
-files = sorted(os.listdir(qt))
+sources = module_sources(qt)
 plan = []
-for fn in files:
-    key = fn[:-len(".safetensors")]
+for key, reader in sources:
+    fn = key + ".safetensors"
     m = re.match(r"model\.language_model\.layers\.(\d+)(\..*)?$", key)
     if m:
         L = int(m.group(1))
         if L >= 45:
-            if want_mtp: plan.append(fn)
-        elif L < NL: plan.append(fn)
+            if want_mtp: plan.append((fn, reader))
+        elif L < NL: plan.append((fn, reader))
     elif key.startswith("model.visual"):
-        if want_vis: plan.append(fn)
+        if want_vis: plan.append((fn, reader))
     else:
-        plan.append(fn)
-print(f"repacking {len(plan)} of {len(files)} module files -> {out} (layers < {NL}, mtp {want_mtp}, vision {want_vis})", flush = True)
-for fn in plan:
-    convert(os.path.join(qt, fn), fn if fn.strip() else "empty.safetensors")
+        plan.append((fn, reader))
+print(f"repacking {len(plan)} of {len(sources)} module files -> {out} (layers < {NL}, mtp {want_mtp}, vision {want_vis})", flush = True)
+for fn, reader in plan:
+    convert(reader, fn if fn.strip() else "empty.safetensors")
 
 c = json.load(open(os.path.join(src, "config.json")))
 tc = c["text_config"]
