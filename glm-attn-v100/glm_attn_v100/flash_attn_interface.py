@@ -1,0 +1,2009 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import logging
+import os
+
+import torch
+
+try:
+    from . import glm_attn_v100_cuda
+except ImportError:
+    import glm_attn_v100_cuda
+from dataclasses import dataclass
+
+try:
+    from torch._subclasses.fake_tensor import FakeTensor
+except ImportError:
+    FakeTensor = None
+
+DEFAULT_DECODE_PARTITION_SIZE = 256
+VALID_DECODE_PARTITION_SIZES = (256, 512, 1024)
+E4M3_XQA_VALID_DECODE_PARTITION_SIZES = (64, 128, 256, 512, 896, 1024, 1664)
+E4M3_XQA_BATCH_VALID_DECODE_PARTITION_SIZES = (64, 128, 256)
+_decode_plan_cache = {}
+_decode_workspace_cache = {}
+_xqa_staged_rescale_workspace_cache = {}
+_turboquant_decode_workspace_cache = {}
+_prefill_splitkv3_workspace_cache = {}
+_grouped_verify_workspace_cache = {}
+logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class _DecodePlan:
+    partition_size: int
+    actual_num_partitions: int
+    launch_num_partitions: int
+    workspace_num_partitions: int
+
+
+@dataclass
+class _DecodeWorkspace:
+    tmp_out: torch.Tensor
+    max_logits: torch.Tensor
+    exp_sums: torch.Tensor
+    active_num_partitions: torch.Tensor
+    max_num_partitions: int
+    captured: bool = False
+    previous: "_DecodeWorkspace | None" = None
+
+
+@dataclass
+class _XQAStagedRescaleWorkspace:
+    buffer: torch.Tensor
+    captured: bool = False
+    previous: "_XQAStagedRescaleWorkspace | None" = None
+
+
+@dataclass
+class _PrefillSplitkv3Workspace:
+    tmp_out: torch.Tensor
+    row_max: torch.Tensor
+    row_sum: torch.Tensor
+    out: torch.Tensor
+    softmax_lse: torch.Tensor
+
+
+@dataclass
+class _GroupedVerifyWorkspace:
+    partial_out: torch.Tensor
+    partial_lse: torch.Tensor
+
+
+def maybe_contiguous(x):
+    return x.contiguous() if x is not None and not x.is_contiguous() else x
+
+
+def _copy_bhmd_to_bmhd_out(
+    out_bhmd: torch.Tensor,
+    out_bmhd: torch.Tensor | None,
+) -> torch.Tensor:
+    out = out_bhmd.permute(0, 2, 1, 3).contiguous()
+    if out_bmhd is not None:
+        out_bmhd.copy_(out)
+        return out_bmhd
+    return out
+
+
+def _is_fake_tensor(x: torch.Tensor) -> bool:
+    return FakeTensor is not None and isinstance(x, FakeTensor)
+
+
+def _can_cache_workspace(x: torch.Tensor) -> bool:
+    return (
+        not torch.compiler.is_compiling() and not x.is_meta and not _is_fake_tensor(x)
+    )
+
+
+def _workspace_stream_id(device: torch.device) -> int:
+    if device.type != "cuda":
+        return -1
+    if torch.compiler.is_compiling():
+        return 0
+    return int(torch.cuda.current_stream(device).cuda_stream)
+
+
+def _round_decode_partition_capacity(required_num_partitions: int) -> int:
+    if required_num_partitions <= 1:
+        return 1
+    return 1 << (required_num_partitions - 1).bit_length()
+
+
+def _decode_dynamic_partitions_enabled() -> bool:
+    return os.getenv("VLLM_FLASH_V100_DECODE_DYNAMIC_PARTITIONS", "1") != "0"
+
+
+def _xqa_staged_pv_enabled() -> bool:
+    return os.getenv("VLLM_FLASH_V100_XQA_STAGED_PV", "0") == "1"
+
+
+def _cuda_graph_capture_active() -> bool:
+    is_capturing = getattr(torch.cuda, "is_current_stream_capturing", None)
+    if is_capturing is None:
+        return False
+    try:
+        return bool(is_capturing())
+    except RuntimeError:
+        return False
+
+
+def _allocate_decode_workspace(
+    q: torch.Tensor,
+    *,
+    batch_capacity: int,
+    num_heads: int,
+    head_dim: int,
+    max_num_partitions: int,
+    partial_dtype: torch.dtype = torch.float16,
+) -> _DecodeWorkspace:
+    return _DecodeWorkspace(
+        tmp_out=torch.empty(
+            (batch_capacity, num_heads, max_num_partitions, head_dim),
+            dtype=partial_dtype,
+            device=q.device,
+        ),
+        max_logits=torch.empty(
+            (batch_capacity, num_heads, max_num_partitions),
+            dtype=torch.float32,
+            device=q.device,
+        ),
+        exp_sums=torch.empty(
+            (batch_capacity, num_heads, max_num_partitions),
+            dtype=torch.float32,
+            device=q.device,
+        ),
+        active_num_partitions=torch.empty(
+            (1,),
+            dtype=torch.int32,
+            device=q.device,
+        ),
+        max_num_partitions=max_num_partitions,
+    )
+
+
+def _get_decode_plan(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    *,
+    max_seq_len_hint: int | None = None,
+    batch_size_hint: int | None = None,
+    workspace_seq_capacity_hint: int | None = None,
+    active_num_partitions: torch.Tensor | None = None,
+    partition_size_hint: int | None = None,
+    valid_partition_sizes: tuple[int, ...] = VALID_DECODE_PARTITION_SIZES,
+) -> _DecodePlan:
+    batch_capacity = batch_size_hint or block_table.shape[0]
+    num_heads = q.shape[1]
+    head_dim = q.shape[2]
+    max_seq_capacity = block_table.shape[1] * k_cache.shape[1]
+    effective_max_seq_len = int(max_seq_len_hint or max_seq_capacity)
+    effective_workspace_seq_capacity = int(
+        workspace_seq_capacity_hint or effective_max_seq_len
+    )
+    effective_max_seq_len = max(1, effective_max_seq_len)
+    effective_workspace_seq_capacity = max(
+        1,
+        effective_workspace_seq_capacity,
+        effective_max_seq_len,
+    )
+    if (
+        workspace_seq_capacity_hint is not None
+        and active_num_partitions is None
+        and _cuda_graph_capture_active()
+    ):
+        # CUDA graph replay replays the captured fill_ into active_num_partitions
+        # instead of rerunning Python planning for the runtime sequence length.
+        # Capture the full workspace envelope so runtime seq_lens, not a stale
+        # short capture hint, bounds the effective decode range inside kernels.
+        effective_max_seq_len = max(
+            effective_max_seq_len,
+            effective_workspace_seq_capacity,
+        )
+    if partition_size_hint is not None:
+        partition_size = _validate_decode_partition_size(
+            int(partition_size_hint),
+            "partition_size_hint",
+            valid_partition_sizes,
+        )
+    else:
+        partition_size = _get_decode_partition_size(
+            max_seq_capacity=max_seq_capacity,
+            head_dim=head_dim,
+            num_q_heads=num_heads,
+            num_kv_heads=k_cache.shape[2],
+            max_seq_len_hint=effective_max_seq_len,
+            batch_size_hint=batch_capacity,
+        )
+        if partition_size not in valid_partition_sizes:
+            if os.getenv("VLLM_FLASH_V100_DECODE_PARTITION_SIZE") is not None:
+                _validate_decode_partition_size(
+                    partition_size,
+                    "VLLM_FLASH_V100_DECODE_PARTITION_SIZE",
+                    valid_partition_sizes,
+                )
+            smaller_sizes = tuple(
+                size for size in valid_partition_sizes if size < partition_size
+            )
+            partition_size = (
+                max(smaller_sizes) if smaller_sizes else min(valid_partition_sizes)
+            )
+    runtime_num_partitions = max(
+        1,
+        (effective_max_seq_len + partition_size - 1) // partition_size,
+    )
+    workspace_num_partitions = max(
+        1,
+        (effective_workspace_seq_capacity + partition_size - 1) // partition_size,
+    )
+    plan = _DecodePlan(
+        partition_size=partition_size,
+        actual_num_partitions=runtime_num_partitions,
+        launch_num_partitions=(
+            workspace_num_partitions
+            if workspace_seq_capacity_hint is not None
+            else runtime_num_partitions
+        ),
+        workspace_num_partitions=workspace_num_partitions,
+    )
+    # Invariant, by construction: actual <= launch <= workspace. Both partition
+    # counts divide by the same positive partition_size, and
+    # effective_workspace_seq_capacity is floored to >= effective_max_seq_len
+    # above (:164-168), so workspace_num_partitions >= runtime_num_partitions;
+    # launch_num_partitions is one of those two. A check of that inequality HERE
+    # would be a tautology that can never fire (it compares three quantities all
+    # derived from the same hints), so it is NOT placed here. The coverage that
+    # actually matters -- launch >= ceil(true seq_lens.max()/ps) -- can only be
+    # checked where the real per-sequence lengths are known, which is the caller
+    # wrappers flash_attn_decode_paged / _xqa; see
+    # _assert_decode_launch_covers_seq_lens.
+    device_index = q.device.index if q.device.index is not None else -1
+    key = (
+        device_index,
+        batch_capacity,
+        num_heads,
+        head_dim,
+        q.dtype,
+        plan.partition_size,
+        plan.actual_num_partitions,
+        plan.launch_num_partitions,
+        plan.workspace_num_partitions,
+    )
+    if _can_cache_workspace(q) and workspace_seq_capacity_hint is None:
+        cached = _decode_plan_cache.get(key)
+        if cached is not None:
+            return cached
+        _decode_plan_cache[key] = plan
+    return plan
+
+
+def _assert_decode_launch_covers_seq_lens(
+    plan: "_DecodePlan",
+    seq_lens: torch.Tensor | None,
+    *,
+    workspace_seq_capacity_hint: int | None,
+) -> None:
+    """Lower-bound coverage guard with REAL rejecting power (DISCIPLINE §3).
+
+    Unlike an inequality among quantities all derived from the same hint (a
+    by-construction tautology inside `_get_decode_plan`), this compares the
+    launched partition count against the batch's TRUE longest sequence, read
+    from the device ``seq_lens`` tensor -- a source INDEPENDENT of the capacity
+    hint. It therefore fires exactly when a capacity hint understates the real
+    max seq_len and the launch grid would silently truncate the longest
+    sequence (the corruption 0007's adversarial probe demonstrated, 328x rms).
+
+    Scope, and why it is scoped: it runs only when a ``workspace_seq_capacity_
+    hint`` was supplied -- the small-query / static-decode path where
+    ``launch_num_partitions == workspace_num_partitions`` can be driven below
+    coverage by a wrong hint, including this patch's own cap arithmetic. Plain
+    q=1 decode passes ``workspace_seq_capacity_hint=None`` (build() ->
+    _attach_decode_shape_hints, static_decode=False), so ``launch == runtime ==
+    ceil(effective_max_seq_len/ps)`` and there is no device sync on the hot
+    path. The q=1 path's own coverage is safe by construction (its hint is
+    ``seq_lens_cpu.max()`` for the same eager forward) and is out of this
+    finding's scope, so it is deliberately NOT guarded here. Skipped under CUDA
+    graph capture, where a ``.item()`` sync is illegal and the captured grid is
+    already sized to the full workspace envelope (:170-182), which covers any
+    runtime seq_len.
+    """
+    if workspace_seq_capacity_hint is None or _cuda_graph_capture_active():
+        return
+    if seq_lens is None or seq_lens.numel() == 0:
+        return
+    true_max_seq_len = int(seq_lens.max().item())
+    required_num_partitions = max(
+        1,
+        (true_max_seq_len + plan.partition_size - 1) // plan.partition_size,
+    )
+    if plan.launch_num_partitions < required_num_partitions:
+        raise RuntimeError(
+            "decode launch grid under-covers the batch: launch_num_partitions="
+            f"{plan.launch_num_partitions} < required={required_num_partitions} "
+            f"to cover max seq_len={true_max_seq_len} "
+            f"(partition_size={plan.partition_size}, "
+            f"workspace_seq_capacity_hint={workspace_seq_capacity_hint}). "
+            "A capacity hint understated the real sequence length; the longest "
+            "sequence would be silently truncated."
+        )
+
+
+def _get_decode_workspace_for_plan(
+    q: torch.Tensor,
+    *,
+    batch_capacity: int,
+    num_heads: int,
+    head_dim: int,
+    plan: _DecodePlan,
+    active_num_partitions: torch.Tensor | None = None,
+    partial_dtype: torch.dtype = torch.float16,
+):
+    device_index = q.device.index if q.device.index is not None else -1
+    stream_id = _workspace_stream_id(q.device)
+    share_rows = os.getenv("VLLM_FLASH_V100_SHARE_DECODE_WORKSPACE", "1") != "0"
+    partition_capacity = _round_decode_partition_capacity(plan.workspace_num_partitions)
+    key = (
+        device_index,
+        stream_id,
+        None if share_rows else batch_capacity,
+        num_heads,
+        head_dim,
+        plan.partition_size,
+        partial_dtype,
+        partition_capacity if share_rows else None,
+    )
+
+    workspace = _decode_workspace_cache.get(key) if _can_cache_workspace(q) else None
+    if (
+        workspace is None
+        or workspace.tmp_out.size(0) < batch_capacity
+        or workspace.max_num_partitions < plan.workspace_num_partitions
+    ):
+        # Capture sizes normally descend, so smaller shapes can use a prefix
+        # of the first allocation. Partition capacities remain separate: a
+        # long single-row request followed by a short batched request must not
+        # multiply the largest row count by the largest context capacity.
+        # A later growth must keep any old addresses
+        # already embedded in graphs alive, including warmup allocations that
+        # were subsequently reused during capture.
+        previous = workspace
+        workspace = _allocate_decode_workspace(
+            q,
+            batch_capacity=max(
+                batch_capacity, previous.tmp_out.size(0) if previous else 0
+            ),
+            num_heads=num_heads,
+            head_dim=head_dim,
+            max_num_partitions=_round_decode_partition_capacity(
+                max(
+                    plan.workspace_num_partitions,
+                    previous.max_num_partitions if previous else 0,
+                )
+            ),
+            partial_dtype=partial_dtype,
+        )
+        if previous is not None:
+            workspace.previous = previous if previous.captured else previous.previous
+        if _can_cache_workspace(q):
+            _decode_workspace_cache[key] = workspace
+
+    if _cuda_graph_capture_active():
+        workspace.captured = True
+    if active_num_partitions is None:
+        workspace.active_num_partitions.fill_(plan.actual_num_partitions)
+        active_num_partitions = workspace.active_num_partitions
+    return (
+        workspace.tmp_out[:batch_capacity],
+        workspace.max_logits[:batch_capacity],
+        workspace.exp_sums[:batch_capacity],
+        active_num_partitions,
+    )
+
+
+def _get_xqa_staged_rescale_workspace(
+    q: torch.Tensor,
+    *,
+    batch_capacity: int,
+    num_heads: int,
+    plan: _DecodePlan,
+) -> torch.Tensor:
+    device_index = q.device.index if q.device.index is not None else -1
+    stream_id = _workspace_stream_id(q.device)
+    max_num_partitions = _round_decode_partition_capacity(
+        max(plan.workspace_num_partitions, plan.launch_num_partitions)
+    )
+    key = (
+        device_index,
+        stream_id,
+        batch_capacity,
+        num_heads,
+        plan.partition_size,
+    )
+    workspace = (
+        _xqa_staged_rescale_workspace_cache.get(key)
+        if _can_cache_workspace(q)
+        else None
+    )
+    if workspace is None or workspace.buffer.size(2) < max_num_partitions:
+        previous = workspace
+        workspace = _XQAStagedRescaleWorkspace(
+            buffer=torch.empty(
+                (batch_capacity, num_heads, max_num_partitions),
+                dtype=torch.float32,
+                device=q.device,
+            ),
+        )
+        if previous is not None:
+            workspace.previous = previous if previous.captured else previous.previous
+        if _can_cache_workspace(q):
+            _xqa_staged_rescale_workspace_cache[key] = workspace
+    # Warmup allocations can become graph storage when reused during capture.
+    if _cuda_graph_capture_active():
+        workspace.captured = True
+    return workspace.buffer
+
+
+def _get_turboquant_decode_workspace(
+    q_rot: torch.Tensor,
+    kv_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    num_kv_splits: int,
+):
+    batch_capacity = block_table.shape[0]
+    num_heads = q_rot.shape[1]
+    head_dim = q_rot.shape[2]
+    max_seq_capacity = block_table.shape[1] * kv_cache.shape[1]
+    per_split_capacity = (max_seq_capacity + num_kv_splits - 1) // num_kv_splits
+    partition_size = next(
+        (size for size in VALID_DECODE_PARTITION_SIZES if per_split_capacity <= size),
+        None,
+    )
+    if partition_size is None:
+        raise ValueError(
+            "TurboQuant Flash-V100 decode cannot cover max_seq_capacity="
+            f"{max_seq_capacity} with num_kv_splits={num_kv_splits}; "
+            f"largest split tile is {VALID_DECODE_PARTITION_SIZES[-1]}"
+        )
+
+    device_index = q_rot.device.index if q_rot.device.index is not None else -1
+    key = (
+        "turboquant",
+        device_index,
+        batch_capacity,
+        num_heads,
+        head_dim,
+        num_kv_splits,
+        partition_size,
+    )
+
+    workspace = _turboquant_decode_workspace_cache.get(key)
+    if workspace is None:
+        workspace = (
+            torch.empty(
+                (batch_capacity, num_heads, num_kv_splits, head_dim),
+                dtype=torch.float32,
+                device=q_rot.device,
+            ),
+            torch.empty(
+                (batch_capacity, num_heads, num_kv_splits),
+                dtype=torch.float32,
+                device=q_rot.device,
+            ),
+            torch.empty(
+                (batch_capacity, num_heads, num_kv_splits),
+                dtype=torch.float32,
+                device=q_rot.device,
+            ),
+        )
+        _turboquant_decode_workspace_cache[key] = workspace
+
+    return workspace, partition_size
+
+
+def _allocate_prefill_splitkv3_workspace(
+    q: torch.Tensor,
+) -> _PrefillSplitkv3Workspace:
+    batch_size, num_heads, query_len, head_dim = q.shape
+    return _PrefillSplitkv3Workspace(
+        tmp_out=torch.empty(
+            (batch_size, num_heads, 3, query_len, head_dim),
+            dtype=torch.float32,
+            device=q.device,
+        ),
+        row_max=torch.empty(
+            (batch_size, num_heads, 3, query_len),
+            dtype=torch.float32,
+            device=q.device,
+        ),
+        row_sum=torch.empty(
+            (batch_size, num_heads, 3, query_len),
+            dtype=torch.float32,
+            device=q.device,
+        ),
+        out=torch.empty(
+            (batch_size, num_heads, query_len, head_dim),
+            dtype=torch.float16,
+            device=q.device,
+        ),
+        softmax_lse=torch.empty(
+            (batch_size, num_heads, query_len),
+            dtype=torch.float32,
+            device=q.device,
+        ),
+    )
+
+
+def _get_prefill_splitkv3_workspace(
+    q: torch.Tensor,
+) -> _PrefillSplitkv3Workspace:
+    if not _can_cache_workspace(q):
+        return _allocate_prefill_splitkv3_workspace(q)
+
+    batch_size, num_heads, query_len, head_dim = q.shape
+    device_index = q.device.index if q.device.index is not None else -1
+    key = (
+        q.device.type,
+        device_index,
+        _workspace_stream_id(q.device),
+        batch_size,
+        num_heads,
+        query_len,
+        head_dim,
+        q.dtype,
+    )
+    workspace = _prefill_splitkv3_workspace_cache.get(key)
+    if workspace is None:
+        workspace = _allocate_prefill_splitkv3_workspace(q)
+        _prefill_splitkv3_workspace_cache[key] = workspace
+    return workspace
+
+
+def _get_grouped_verify_workspace(
+    q: torch.Tensor,
+    batch_size: int = 1,
+    *,
+    partial_dtype: torch.dtype = torch.float16,
+) -> _GroupedVerifyWorkspace:
+    query_len = q.shape[0] // batch_size
+    max_query_tokens = 16 if query_len > 8 else 8
+    grouped_splits = 640 // max_query_tokens
+    device_index = q.device.index if q.device.index is not None else -1
+    key = (
+        q.device.type,
+        device_index,
+        _workspace_stream_id(q.device),
+        batch_size,
+        max_query_tokens,
+        q.dtype,
+        partial_dtype,
+    )
+    workspace = (
+        _grouped_verify_workspace_cache.get(key) if _can_cache_workspace(q) else None
+    )
+    if workspace is None:
+        partial_out_shape = (
+            (grouped_splits, max_query_tokens, 6, 256)
+            if batch_size == 1
+            else (batch_size, grouped_splits, max_query_tokens, 6, 256)
+        )
+        partial_lse_shape = (
+            (grouped_splits, max_query_tokens, 6)
+            if batch_size == 1
+            else (batch_size, grouped_splits, max_query_tokens, 6)
+        )
+        workspace = _GroupedVerifyWorkspace(
+            partial_out=torch.empty(
+                partial_out_shape,
+                dtype=partial_dtype,
+                device=q.device,
+            ),
+            partial_lse=torch.empty(
+                (*partial_lse_shape, 2)
+                if partial_dtype == torch.float32
+                else partial_lse_shape,
+                dtype=torch.float32,
+                device=q.device,
+            ),
+        )
+        if _can_cache_workspace(q):
+            _grouped_verify_workspace_cache[key] = workspace
+    return workspace
+
+
+def _get_decode_partition_size(
+    max_seq_capacity: int,
+    head_dim: int,
+    num_q_heads: int,
+    num_kv_heads: int,
+    max_seq_len_hint: int | None = None,
+    batch_size_hint: int | None = None,
+) -> int:
+    raw = os.getenv("VLLM_FLASH_V100_DECODE_PARTITION_SIZE")
+    if raw is None:
+        return _select_default_decode_partition_size(max_seq_len_hint)
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError(
+            "VLLM_FLASH_V100_DECODE_PARTITION_SIZE must be one of "
+            f"{VALID_DECODE_PARTITION_SIZES}, got {raw!r}"
+        ) from exc
+    return _validate_decode_partition_size(
+        value,
+        "VLLM_FLASH_V100_DECODE_PARTITION_SIZE",
+    )
+
+
+def _select_default_decode_partition_size(
+    max_seq_len_hint: int | None,
+) -> int:
+    if max_seq_len_hint is None:
+        return DEFAULT_DECODE_PARTITION_SIZE
+
+    seq_len = max(1, int(max_seq_len_hint))
+    if seq_len >= 32768:
+        return 1024
+    return DEFAULT_DECODE_PARTITION_SIZE
+
+
+def _validate_decode_partition_size(
+    value: int,
+    name: str,
+    valid_partition_sizes: tuple[int, ...] = VALID_DECODE_PARTITION_SIZES,
+) -> int:
+    if value not in valid_partition_sizes:
+        raise ValueError(f"{name} must be one of {valid_partition_sizes}, got {value}")
+    return value
+
+
+def _flash_attn_forward(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    out: torch.Tensor | None,
+    dropout_p: float,
+    softmax_scale: float,
+    causal: bool,
+    window_size_left: int,
+    window_size_right: int,
+    softcap: float,
+    alibi_slopes: torch.Tensor,
+    return_softmax: bool,
+) -> tuple:
+    q, k, v = map(maybe_contiguous, (q, k, v))
+    out = maybe_contiguous(out)
+    if out is None:
+        out = torch.zeros_like(q)
+    outputs = glm_attn_v100_cuda.fwd(
+        q,
+        k,
+        v,
+        out,
+        alibi_slopes,
+        dropout_p,
+        softmax_scale,
+        causal,
+        window_size_left,
+        window_size_right,
+        softcap,
+        return_softmax,
+        None,
+    )
+    return outputs[0], outputs[1], None, None
+
+
+def _flash_attn_backward(
+    dout: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    out: torch.Tensor,
+    softmax_lse: torch.Tensor,
+    dq: torch.Tensor,
+    dk: torch.Tensor,
+    dv: torch.Tensor,
+    dropout_p: float,
+    softmax_scale: float,
+    causal: bool,
+    window_size_left: int,
+    window_size_right: int,
+    softcap: float,
+    alibi_slopes: torch.Tensor,
+    deterministic: bool,
+    rng_state: torch.Tensor = None,
+) -> torch.Tensor:
+    dout, q, k, v, out = map(maybe_contiguous, (dout, q, k, v, out))
+    grads = glm_attn_v100_cuda.bwd(
+        dout,
+        q,
+        k,
+        v,
+        out,
+        softmax_lse,
+        dq,
+        dk,
+        dv,
+        alibi_slopes,
+        dropout_p,
+        softmax_scale,
+        causal,
+        window_size_left,
+        window_size_right,
+        softcap,
+        deterministic,
+        None,
+        rng_state,
+    )
+    return grads[0], grads[1], grads[2]
+
+
+class FlashAttnFunc(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        dropout_p: float,
+        softmax_scale: float,
+        causal: bool,
+        window_size: tuple,
+        softcap: float,
+        alibi_slopes: torch.Tensor,
+        deterministic: bool,
+        return_softmax: bool,
+        is_grad_enabled: bool,
+        out: torch.Tensor | None,
+    ):
+        q_ = q.permute(0, 2, 1, 3).contiguous()
+        k_ = k.permute(0, 2, 1, 3).contiguous()
+        v_ = v.permute(0, 2, 1, 3).contiguous()
+
+        B, M, H, D = q.shape
+        _, N, _, _ = k.shape
+
+        if D % 8 != 0:
+            raise ValueError(f"head_dim={D} must be divisible by 8 for Volta kernel")
+
+        if dropout_p != 0.0:
+            raise NotImplementedError("dropout_p != 0.0 not supported")
+
+        if alibi_slopes is not None:
+            raise NotImplementedError("alibi_slopes not supported")
+
+        if softcap != 0.0:
+            raise NotImplementedError("softcap != 0.0 not supported")
+
+        if q_.shape[1] % k_.shape[1] != 0:
+            raise ValueError(
+                f"invalid head mapping: q has {q_.shape[1]} heads, "
+                f"k has {k_.shape[1]} heads"
+            )
+        if k_.shape[1] != v_.shape[1]:
+            raise ValueError(
+                f"k/v head mismatch: k has {k_.shape[1]}, v has {v_.shape[1]}"
+            )
+
+        window_size_left, window_size_right = window_size
+        if window_size_left < -1 or window_size_right < -1:
+            raise ValueError(f"Invalid window_size={window_size}; values must be >= -1")
+
+        out_, lse_, _, rng_state = _flash_attn_forward(
+            q_,
+            k_,
+            v_,
+            out.permute(0, 2, 1, 3).contiguous() if out is not None else None,
+            dropout_p,
+            softmax_scale,
+            causal,
+            window_size_left,
+            window_size_right,
+            softcap,
+            alibi_slopes,
+            return_softmax,
+        )
+
+        out = _copy_bhmd_to_bmhd_out(out_, out)
+
+        if is_grad_enabled and q.requires_grad:
+            ctx.save_for_backward(q_, k_, v_, out_, lse_, rng_state)
+            ctx.dropout_p = dropout_p
+            ctx.softmax_scale = softmax_scale
+            ctx.causal = causal
+            ctx.window_size = window_size
+            ctx.softcap = softcap
+            ctx.alibi_slopes = alibi_slopes
+            ctx.deterministic = deterministic
+
+        return out if not return_softmax else (out, lse_, None)
+
+    @staticmethod
+    def backward(ctx, dout, *args):
+        q_, k_, v_, out_, lse_, rng_state = ctx.saved_tensors
+
+        dout_ = dout.permute(0, 2, 1, 3).contiguous()
+
+        dq_ = torch.empty_like(q_)
+        dk_ = torch.empty_like(k_)
+        dv_ = torch.empty_like(v_)
+
+        _flash_attn_backward(
+            dout_,
+            q_,
+            k_,
+            v_,
+            out_,
+            lse_,
+            dq_,
+            dk_,
+            dv_,
+            ctx.dropout_p,
+            ctx.softmax_scale,
+            ctx.causal,
+            ctx.window_size[0],
+            ctx.window_size[1],
+            ctx.softcap,
+            ctx.alibi_slopes,
+            ctx.deterministic,
+            rng_state,
+        )
+
+        dq = dq_.permute(0, 2, 1, 3)
+        dk = dk_.permute(0, 2, 1, 3)
+        dv = dv_.permute(0, 2, 1, 3)
+
+        return dq, dk, dv, None, None, None, None, None, None, None, None, None, None
+
+
+def flash_attn_func(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    dropout_p: float = 0.0,
+    softmax_scale: float = None,
+    causal: bool = False,
+    window_size: tuple = (-1, -1),
+    softcap: float = 0.0,
+    alibi_slopes: torch.Tensor = None,
+    deterministic: bool = False,
+    return_attn_probs: bool = False,
+    out: torch.Tensor | None = None,
+):
+    if softmax_scale is None:
+        softmax_scale = q.shape[-1] ** -0.5
+
+    try:
+        return FlashAttnFunc.apply(
+            q,
+            k,
+            v,
+            dropout_p,
+            softmax_scale,
+            causal,
+            window_size,
+            softcap,
+            alibi_slopes,
+            deterministic,
+            return_attn_probs,
+            torch.is_grad_enabled(),
+            out,
+        )
+    except Exception:
+        logger.debug(
+            "FlashAttention-V100 flash_attn_func failed "
+            "(q=%s/%s/%s, k=%s/%s/%s, v=%s/%s/%s, causal=%s, "
+            "window_size=%s, softmax_scale=%s)",
+            list(q.shape),
+            q.dtype,
+            q.device,
+            list(k.shape),
+            k.dtype,
+            k.device,
+            list(v.shape),
+            v.dtype,
+            v.device,
+            causal,
+            window_size,
+            softmax_scale,
+            exc_info=True,
+        )
+        raise
+
+
+def flash_attn_bhmd_func(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    dropout_p: float = 0.0,
+    softmax_scale: float = None,
+    causal: bool = False,
+    window_size: tuple = (-1, -1),
+    softcap: float = 0.0,
+    alibi_slopes: torch.Tensor = None,
+    return_attn_probs: bool = False,
+    out: torch.Tensor | None = None,
+):
+    """Forward-only Flash-V100 dense attention for [B, H, T, D] tensors."""
+    if softmax_scale is None:
+        softmax_scale = q.shape[-1] ** -0.5
+    if dropout_p != 0.0:
+        raise NotImplementedError("dropout_p != 0.0 not supported")
+    if softcap != 0.0:
+        raise NotImplementedError("softcap != 0.0 not supported")
+    if alibi_slopes is not None:
+        raise NotImplementedError("alibi_slopes not supported")
+
+    window_size_left, window_size_right = window_size
+    out, lse, _, _ = _flash_attn_forward(
+        q,
+        k,
+        v,
+        out,
+        dropout_p,
+        softmax_scale,
+        causal,
+        window_size_left,
+        window_size_right,
+        softcap,
+        alibi_slopes,
+        return_attn_probs,
+    )
+    return out if not return_attn_probs else (out, lse, None)
+
+
+def flash_attn_qk_scores(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    softmax_scale: float | None = None,
+    causal: bool = False,
+):
+    """Debug-only Flash-V100 QK score dump before softmax."""
+    if softmax_scale is None:
+        softmax_scale = q.shape[-1] ** -0.5
+
+    q = maybe_contiguous(q)
+    k = maybe_contiguous(k)
+    q_ = q.permute(0, 2, 1, 3).contiguous()
+    k_ = k.permute(0, 2, 1, 3).contiguous()
+    return glm_attn_v100_cuda.qk_scores_fwd(q_, k_, softmax_scale, causal)
+
+
+def flash_attn_lse(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    softmax_scale: float | None = None,
+    causal: bool = False,
+):
+    """Debug-only Flash-V100 softmax LSE dump."""
+    if softmax_scale is None:
+        softmax_scale = q.shape[-1] ** -0.5
+
+    q, k, v = map(maybe_contiguous, (q, k, v))
+    q_ = q.permute(0, 2, 1, 3).contiguous()
+    k_ = k.permute(0, 2, 1, 3).contiguous()
+    v_ = v.permute(0, 2, 1, 3).contiguous()
+    _, lse, _, _ = _flash_attn_forward(
+        q_,
+        k_,
+        v_,
+        None,
+        0.0,
+        softmax_scale,
+        causal,
+        -1,
+        -1,
+        0.0,
+        None,
+        False,
+    )
+    return lse
+
+
+def flash_attn_decode_paged(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    seq_lens: torch.Tensor,
+    softmax_scale: float | None = None,
+    out: torch.Tensor | None = None,
+    kv_cache_dtype: str = "auto",
+    k_scale: float = 1.0,
+    v_scale: float = 1.0,
+    window_size: tuple = (-1, -1),
+    max_seq_len_hint: int | None = None,
+    workspace_seq_capacity_hint: int | None = None,
+    active_num_partitions: torch.Tensor | None = None,
+    partition_size_hint: int | None = None,
+    anchor_lens: torch.Tensor | None = None,
+    anchored_window: int = 0,
+):
+    if softmax_scale is None:
+        softmax_scale = q.shape[-1] ** -0.5
+
+    e4m3_fp32 = kv_cache_dtype in ("fp8", "fp8_e4m3")
+    if e4m3_fp32 and not flash_attn_grouped_e4m3_fp32_available():
+        raise RuntimeError(
+            "Rebuild Flash-V100 for E4M3 FP32 scalar decode (precision revision 4)"
+        )
+    q = maybe_contiguous(q)
+    block_table = maybe_contiguous(block_table)
+    seq_lens = maybe_contiguous(seq_lens)
+    out = maybe_contiguous(out)
+    anchor_lens = maybe_contiguous(anchor_lens)
+    window_size_left, window_size_right = window_size
+    if window_size_left < -1 or window_size_right < -1:
+        raise ValueError(f"Invalid window_size={window_size}; values must be >= -1")
+    if anchored_window < 0:
+        raise ValueError("anchored_window must be non-negative")
+    if (anchored_window > 0) != (anchor_lens is not None):
+        raise ValueError(
+            "anchor_lens and a positive anchored_window must be provided together"
+        )
+    batch_capacity = q.shape[0]
+    num_heads = q.shape[1]
+    head_dim = q.shape[2]
+    if not _decode_dynamic_partitions_enabled():
+        max_seq_len_hint = None
+        workspace_seq_capacity_hint = None
+        active_num_partitions = None
+    plan = _get_decode_plan(
+        q,
+        k_cache,
+        block_table,
+        max_seq_len_hint=max_seq_len_hint,
+        batch_size_hint=batch_capacity,
+        workspace_seq_capacity_hint=workspace_seq_capacity_hint,
+        active_num_partitions=active_num_partitions,
+        partition_size_hint=partition_size_hint,
+    )
+    _assert_decode_launch_covers_seq_lens(
+        plan,
+        seq_lens,
+        workspace_seq_capacity_hint=workspace_seq_capacity_hint,
+    )
+    if (
+        os.getenv(
+            "VLLM_FLASH_V100_E4M3_SCALAR_FAST",
+            os.getenv("VLLM_FLASH_V100_TP2_E4M3_SCALAR_FAST", "1"),
+        )
+        == "1"
+        and e4m3_fp32
+        and q.dtype == torch.float16
+        and q.shape[2] == 256
+        and plan.partition_size == 1024
+        and window_size_left == window_size_right == -1
+        and anchor_lens is None
+    ):
+        version = getattr(glm_attn_v100_cuda, "tp2_e4m3_scalar_fast_version", None)
+        if not callable(version) or int(version()) < 3:
+            raise RuntimeError("Rebuild Flash-V100 for E4M3 scalar fast revision 3")
+    tmp_out, max_logits, exp_sums, active_num_partitions = (
+        _get_decode_workspace_for_plan(
+            q,
+            batch_capacity=batch_capacity,
+            num_heads=num_heads,
+            head_dim=head_dim,
+            plan=plan,
+            active_num_partitions=active_num_partitions,
+            partial_dtype=torch.float32 if e4m3_fp32 else torch.float16,
+        )
+    )
+
+    return glm_attn_v100_cuda.decode_paged_fwd(
+        q,
+        k_cache,
+        v_cache,
+        out,
+        block_table,
+        seq_lens,
+        tmp_out,
+        max_logits,
+        exp_sums,
+        active_num_partitions,
+        softmax_scale,
+        plan.partition_size,
+        plan.launch_num_partitions,
+        kv_cache_dtype,
+        float(k_scale),
+        float(v_scale),
+        int(window_size_left),
+        int(window_size_right),
+        anchor_lens,
+        int(anchored_window),
+    )
+
+
+def flash_attn_decode_paged_xqa_available() -> bool:
+    return hasattr(glm_attn_v100_cuda, "decode_paged_xqa_fwd")
+
+
+def flash_attn_decode_paged_xqa_staged_available() -> bool:
+    return hasattr(glm_attn_v100_cuda, "decode_paged_xqa_staged_fwd")
+
+
+def flash_attn_grouped_verify_max_query_tokens() -> int:
+    """Return the native grouped-verifier query-length capability.
+
+    Extensions built before q16 support do not expose the capability entry.
+    Those binaries support q8, so keep source-overlay deployments safe by
+    falling back to the legacy limit instead of routing q16 into the old op.
+    """
+    get_max_query_tokens = getattr(
+        glm_attn_v100_cuda,
+        "grouped_verify_max_query_tokens",
+        None,
+    )
+    if get_max_query_tokens is None:
+        return 8
+    return int(get_max_query_tokens())
+
+
+def flash_attn_grouped_verify_request_major_abi_version() -> int:
+    """Return zero for binaries that only support single-request grouping."""
+    get_abi_version = getattr(
+        glm_attn_v100_cuda,
+        "grouped_verify_request_major_abi_version",
+        None,
+    )
+    return 0 if get_abi_version is None else int(get_abi_version())
+
+
+def flash_attn_grouped_e4m3_fp32_available(min_version: int = 4) -> bool:
+    version = getattr(glm_attn_v100_cuda, "grouped_e4m3_fp32_precision_version", None)
+    return (
+        hasattr(glm_attn_v100_cuda, "grouped_e4m3_fp32_paged_fwd")
+        and callable(version)
+        and int(version()) >= min_version
+    )
+
+
+def flash_attn_grouped_e4m3_fp32_paged(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    row_lengths: torch.Tensor,
+    *,
+    out: torch.Tensor,
+    softmax_scale: float,
+    k_scale: float = 1.0,
+    v_scale: float = 1.0,
+) -> torch.Tensor:
+    """E4M3 q2..8/B1 or request-major q8/B2..16 GQA6/D256 attention.
+
+    Row lengths are authoritative GPU metadata, not inferred from padded Q.
+    Zero lengths produce zero outputs. All positive lengths must fit the
+    block table, whose entries must address valid physical pages. This is
+    q8 batches use one block-table row per independent request. QK/PV and
+    partial storage are FP32;
+    Tensor Core operands and final output remain FP16. KV must encode E4M3.
+    Precision revision 3 retains FP32 numerators and separate max/sum until
+    the final normalization, as well as compensated QK/P and tile-local PV.
+    Revision 4 adds DFlash2 1728/3456 pages and FP32 scalar fallback workspace.
+    """
+    if not flash_attn_grouped_e4m3_fp32_available():
+        raise RuntimeError(
+            "Rebuild Flash-V100 for E4M3 grouped FP32 precision revision 4"
+        )
+    if (
+        q.shape[1] != 6
+        or k_cache.shape[1] not in (800, 848, 1616, 1648, 1728, 3296, 3456)
+    ) and int(glm_attn_v100_cuda.grouped_e4m3_fp32_precision_version()) < 5:
+        raise RuntimeError("Rebuild Flash-V100 for multi-head E4M3 revision 5")
+    batch_size = block_table.shape[0]
+    if batch_size > 1 and not flash_attn_grouped_e4m3_fp32_available(6):
+        raise RuntimeError("Rebuild Flash-V100 for request-major E4M3 revision 6")
+    workspace = _get_grouped_verify_workspace(
+        q, batch_size=batch_size, partial_dtype=torch.float32
+    )
+    return glm_attn_v100_cuda.grouped_e4m3_fp32_paged_fwd(
+        q,
+        k_cache,
+        v_cache,
+        out,
+        block_table,
+        row_lengths,
+        workspace.partial_out,
+        workspace.partial_lse,
+        float(softmax_scale),
+        float(k_scale),
+        float(v_scale),
+    )
+
+
+def flash_attn_grouped_verify_paged(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    seq_lens: torch.Tensor,
+    softmax_scale: float | None = None,
+    out: torch.Tensor | None = None,
+    kv_cache_dtype: str = "fp8_e5m2",
+    k_scale: float = 1.0,
+    v_scale: float = 1.0,
+    one_pass: bool = False,
+) -> torch.Tensor:
+    """Exact request-major grouped q8/q16 H6/D256 DFlash2 verifier for SM70.
+
+    Each request has one block-table row and a uniform contiguous query span.
+    The native entry keeps all causal verifier rows together and reuses each
+    paged-KV scan across a packed GQA group. Single-request q16 uses two
+    three-head groups; batched requests use request-major q8 groups. Workspaces
+    are stream- and batch-local and CUDA-graph safe.
+    """
+    if softmax_scale is None:
+        softmax_scale = q.shape[-1] ** -0.5
+    q = maybe_contiguous(q)
+    block_table = maybe_contiguous(block_table)
+    seq_lens = maybe_contiguous(seq_lens)
+    out = maybe_contiguous(out)
+    workspace = _get_grouped_verify_workspace(q, int(block_table.shape[0]))
+    return glm_attn_v100_cuda.grouped_verify_paged_fwd(
+        q,
+        k_cache,
+        v_cache,
+        out,
+        block_table,
+        seq_lens,
+        workspace.partial_out,
+        workspace.partial_lse,
+        float(softmax_scale),
+        kv_cache_dtype,
+        float(k_scale),
+        float(v_scale),
+        bool(one_pass),
+    )
+
+
+# Older native extensions retain the E5M2 route until rebuilt.
+flash_attn_grouped_verify_paged.supports_e4m3 = bool(  # type: ignore[attr-defined]
+    getattr(glm_attn_v100_cuda, "grouped_verify_e4m3", False)
+)
+
+
+def flash_attn_decode_paged_xqa(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    seq_lens: torch.Tensor,
+    softmax_scale: float | None = None,
+    out: torch.Tensor | None = None,
+    kv_cache_dtype: str = "auto",
+    k_scale: float = 1.0,
+    v_scale: float = 1.0,
+    window_size: tuple = (-1, -1),
+    max_seq_len_hint: int | None = None,
+    workspace_seq_capacity_hint: int | None = None,
+    active_num_partitions: torch.Tensor | None = None,
+    partition_size_hint: int | None = None,
+    batch_context_routing: bool = False,
+):
+    if not flash_attn_decode_paged_xqa_available():
+        raise RuntimeError("glm_attn_v100 CUDA extension lacks XQA decode")
+    if softmax_scale is None:
+        softmax_scale = q.shape[-1] ** -0.5
+
+    q = maybe_contiguous(q)
+    block_table = maybe_contiguous(block_table)
+    seq_lens = maybe_contiguous(seq_lens)
+    out = maybe_contiguous(out)
+    window_size_left, window_size_right = window_size
+    if window_size_left < -1 or window_size_right < -1:
+        raise ValueError(f"Invalid window_size={window_size}; values must be >= -1")
+    batch_capacity = q.shape[0]
+    num_heads = q.shape[1]
+    head_dim = q.shape[2]
+    if not _decode_dynamic_partitions_enabled():
+        max_seq_len_hint = None
+        workspace_seq_capacity_hint = None
+        active_num_partitions = None
+    plan = _get_decode_plan(
+        q,
+        k_cache,
+        block_table,
+        max_seq_len_hint=max_seq_len_hint,
+        batch_size_hint=batch_capacity,
+        workspace_seq_capacity_hint=workspace_seq_capacity_hint,
+        active_num_partitions=active_num_partitions,
+        partition_size_hint=partition_size_hint,
+        valid_partition_sizes=(
+            E4M3_XQA_BATCH_VALID_DECODE_PARTITION_SIZES
+            if kv_cache_dtype in ("fp8", "fp8_e4m3")
+            and q.ndim == 3
+            and k_cache.shape[2] > 0
+            and q.shape[1:] == (6 * k_cache.shape[2], 256)
+            and os.getenv("VLLM_FLASH_V100_E4M3_BATCH_XQA", "1") == "1"
+            and q.shape[0] > 1
+            and k_cache.dtype == torch.uint8
+            and v_cache.dtype == torch.uint8
+            else (
+                E4M3_XQA_VALID_DECODE_PARTITION_SIZES
+                if kv_cache_dtype in ("fp8", "fp8_e4m3")
+                and q.ndim == 3
+                and k_cache.shape[2] > 0
+                and q.shape == (1, 6 * k_cache.shape[2], 256)
+                and k_cache.shape[1] >= 256
+                and k_cache.shape[1] % 16 == 0
+                and k_cache.dtype == torch.uint8
+                and v_cache.dtype == torch.uint8
+                else (
+                    E4M3_XQA_BATCH_VALID_DECODE_PARTITION_SIZES
+                    if kv_cache_dtype in ("fp8", "fp8_e4m3")
+                    else VALID_DECODE_PARTITION_SIZES
+                )
+            )
+        ),
+    )
+    _assert_decode_launch_covers_seq_lens(
+        plan,
+        seq_lens,
+        workspace_seq_capacity_hint=workspace_seq_capacity_hint,
+    )
+    tmp_out, max_logits, exp_sums, active_num_partitions = (
+        _get_decode_workspace_for_plan(
+            q,
+            batch_capacity=batch_capacity,
+            num_heads=num_heads,
+            head_dim=head_dim,
+            plan=plan,
+            active_num_partitions=active_num_partitions,
+            partial_dtype=(
+                torch.float32
+                if kv_cache_dtype in ("fp8", "fp8_e4m3")
+                else torch.float16
+            ),
+        )
+    )
+
+    q_per_kv = q.shape[1] // k_cache.shape[2]
+    use_staged_pv = (
+        _xqa_staged_pv_enabled()
+        and flash_attn_decode_paged_xqa_staged_available()
+        and os.getenv("VLLM_FLASH_V100_XQA_PADDED_SMEM", "1") != "0"
+        and os.getenv("VLLM_FLASH_V100_XQA_G6_DUAL_CTA", "0") == "1"
+        and plan.partition_size == 256
+        and q.shape[2] == 256
+        and q_per_kv == 6
+        and k_cache.dtype == torch.float16
+        and v_cache.dtype == torch.float16
+    )
+    if use_staged_pv:
+        online_rescales = _get_xqa_staged_rescale_workspace(
+            q,
+            batch_capacity=batch_capacity,
+            num_heads=num_heads,
+            plan=plan,
+        )
+        return glm_attn_v100_cuda.decode_paged_xqa_staged_fwd(
+            q,
+            k_cache,
+            v_cache,
+            out,
+            block_table,
+            seq_lens,
+            tmp_out,
+            max_logits,
+            exp_sums,
+            online_rescales,
+            active_num_partitions,
+            softmax_scale,
+            plan.partition_size,
+            plan.launch_num_partitions,
+            kv_cache_dtype,
+            float(k_scale),
+            float(v_scale),
+            int(window_size_left),
+            int(window_size_right),
+        )
+
+    batch_context_max_seq_len = 0
+    if batch_context_routing:
+        live_max_seq_len = int(max_seq_len_hint or 0)
+        workspace_max_seq_len = int(workspace_seq_capacity_hint or 0)
+        if _cuda_graph_capture_active():
+            batch_context_max_seq_len = max(
+                live_max_seq_len,
+                workspace_max_seq_len,
+            )
+        else:
+            batch_context_max_seq_len = live_max_seq_len
+        if batch_context_max_seq_len <= 0:
+            batch_context_max_seq_len = workspace_max_seq_len
+        if batch_context_max_seq_len <= 0:
+            batch_context_max_seq_len = plan.launch_num_partitions * plan.partition_size
+
+    return glm_attn_v100_cuda.decode_paged_xqa_fwd(
+        q,
+        k_cache,
+        v_cache,
+        out,
+        block_table,
+        seq_lens,
+        tmp_out,
+        max_logits,
+        exp_sums,
+        active_num_partitions,
+        softmax_scale,
+        plan.partition_size,
+        plan.launch_num_partitions,
+        kv_cache_dtype,
+        float(k_scale),
+        float(v_scale),
+        int(window_size_left),
+        int(window_size_right),
+        int(batch_context_max_seq_len),
+    )
+
+
+def flash_attn_decode_paged_wmma(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    seq_lens: torch.Tensor,
+    softmax_scale: float | None = None,
+    out: torch.Tensor | None = None,
+    kv_cache_dtype: str = "auto",
+    k_scale: float = 1.0,
+    v_scale: float = 1.0,
+):
+    """Single-query decode using the paged-prefill WMMA compute order.
+
+    ``q`` has the same [B, H, D] shape as ``flash_attn_decode_paged``.
+    """
+    if softmax_scale is None:
+        softmax_scale = q.shape[-1] ** -0.5
+
+    q = maybe_contiguous(q)
+    block_table = maybe_contiguous(block_table)
+    seq_lens = maybe_contiguous(seq_lens)
+    out = maybe_contiguous(out)
+
+    return glm_attn_v100_cuda.decode_paged_wmma_fwd(
+        q,
+        k_cache,
+        v_cache,
+        out,
+        block_table,
+        seq_lens,
+        softmax_scale,
+        kv_cache_dtype,
+        float(k_scale),
+        float(v_scale),
+    )
+
+
+def flash_attn_decode_qk_scores(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    seq_lens: torch.Tensor,
+    softmax_scale: float | None = None,
+    kv_cache_dtype: str = "auto",
+    k_scale: float = 1.0,
+):
+    """Debug-only scalar paged decode QK score dump before softmax."""
+    if softmax_scale is None:
+        softmax_scale = q.shape[-1] ** -0.5
+
+    q = maybe_contiguous(q)
+    block_table = maybe_contiguous(block_table)
+    seq_lens = maybe_contiguous(seq_lens)
+    max_seq_capacity = block_table.shape[1] * k_cache.shape[1]
+    partition_size = _get_decode_partition_size(
+        max_seq_capacity=max_seq_capacity,
+        head_dim=q.shape[2],
+        num_q_heads=q.shape[1],
+        num_kv_heads=k_cache.shape[2],
+    )
+    return glm_attn_v100_cuda.decode_qk_scores_fwd(
+        q,
+        k_cache,
+        block_table,
+        seq_lens,
+        softmax_scale,
+        partition_size,
+        kv_cache_dtype,
+        float(k_scale),
+    )
+
+
+def flash_attn_turboquant_decode_paged_available() -> bool:
+    return hasattr(glm_attn_v100_cuda, "decode_turboquant_paged_fwd")
+
+
+def flash_attn_turboquant_decode_paged(
+    q_rot: torch.Tensor,
+    kv_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    seq_lens: torch.Tensor,
+    centroids: torch.Tensor,
+    softmax_scale: float | None = None,
+    out: torch.Tensor | None = None,
+    mse_bits: int = 4,
+    value_quant_bits: int = 4,
+    norm_correction: bool = True,
+    num_kv_splits: int = 32,
+):
+    if not flash_attn_turboquant_decode_paged_available():
+        raise RuntimeError("glm_attn_v100 CUDA extension lacks TurboQuant decode")
+    if softmax_scale is None:
+        softmax_scale = q_rot.shape[-1] ** -0.5
+
+    q_rot = maybe_contiguous(q_rot)
+    kv_cache = maybe_contiguous(kv_cache)
+    block_table = maybe_contiguous(block_table)
+    seq_lens = maybe_contiguous(seq_lens)
+    centroids = maybe_contiguous(centroids)
+    out = maybe_contiguous(out)
+    (tmp_out, max_logits, exp_sums), partition_size = _get_turboquant_decode_workspace(
+        q_rot, kv_cache, block_table, int(num_kv_splits)
+    )
+
+    return glm_attn_v100_cuda.decode_turboquant_paged_fwd(
+        q_rot,
+        kv_cache,
+        out,
+        block_table,
+        seq_lens,
+        tmp_out,
+        max_logits,
+        exp_sums,
+        centroids,
+        softmax_scale,
+        partition_size,
+        int(mse_bits),
+        int(value_quant_bits),
+        bool(norm_correction),
+    )
+
+
+def flash_attn_prefill_paged(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    seq_lens: torch.Tensor,
+    softmax_scale: float | None = None,
+    out: torch.Tensor | None = None,
+    kv_cache_dtype: str = "auto",
+    k_scale: float = 1.0,
+    v_scale: float = 1.0,
+    causal: bool = True,
+    window_size: tuple = (-1, -1),
+    anchor_lens: torch.Tensor | None = None,
+    anchored_window: int = 0,
+    dflash2_window_split: bool = True,
+):
+    if softmax_scale is None:
+        softmax_scale = q.shape[-1] ** -0.5
+
+    if (
+        not causal
+        and window_size == (2047, 2047)
+        and anchor_lens is None
+        and anchored_window == 0
+        and q.is_cuda
+        and q.dtype == torch.float16
+        and q.ndim == 4
+        and 1 <= q.shape[0] <= 4
+        and q.shape[1] == 8
+        and q.shape[2] in (8, 16)
+        and q.shape[3] == 128
+        and k_cache.dtype == v_cache.dtype == torch.float16
+        and kv_cache_dtype in ("auto", "fp16")
+        and k_cache.ndim == v_cache.ndim == 4
+        and k_cache.shape[1] in (832, 1024, 1648, 2048)
+        and (dflash2_window_split or k_cache.shape[1] in (1024, 2048))
+        and k_cache.shape[2:] == v_cache.shape[2:] == (q.shape[2] // 4, 128)
+        and k_cache.stride(-1) == v_cache.stride(-1) == 1
+        and torch.cuda.get_device_capability(q.device) == (7, 0)
+        and (out is None or out.is_contiguous())
+    ):
+        # Single-request query blocks benefit from splitting the live window.
+        # Concurrent blocks retain the qualified native WMMA route.
+        if (
+            q.shape[0] == 1
+            and q.is_contiguous()
+            and k_cache.device == v_cache.device == q.device
+            and k_cache.shape == v_cache.shape
+            and block_table.device == seq_lens.device == q.device
+            and block_table.dtype == seq_lens.dtype == torch.int32
+            and block_table.ndim == 2
+            and block_table.shape[0] == 1
+            and seq_lens.shape == (1,)
+            and (
+                out is None
+                or (
+                    out.shape == q.shape
+                    and out.dtype == q.dtype
+                    and out.device == q.device
+                )
+            )
+        ):
+            try:
+                from .sm70_dflash2_split import forward as split_window
+            except ImportError:
+                split_window = None
+            if split_window is not None:
+                return split_window(
+                    q,
+                    k_cache,
+                    v_cache,
+                    block_table.contiguous(),
+                    seq_lens,
+                    softmax_scale,
+                    out,
+                )
+        # The split kernel uses the live page size and strides. The native
+        # concurrent kernel has a narrower page ABI: never send page832/1648 to it,
+        # including when the optional split implementation cannot be imported.
+        if (
+            q.shape[2] == 8
+            and k_cache.shape[1] in (1024, 2048)
+            and hasattr(glm_attn_v100_cuda, "dflash2_paged_bmhd_fwd")
+        ):
+            return glm_attn_v100_cuda.dflash2_paged_bmhd_fwd(
+                q.contiguous(),
+                k_cache,
+                v_cache,
+                out,
+                block_table.contiguous(),
+                seq_lens.contiguous(),
+                softmax_scale,
+            )
+
+    out_original = out
+    q = maybe_contiguous(q)
+    block_table = maybe_contiguous(block_table)
+    seq_lens = maybe_contiguous(seq_lens)
+    out = maybe_contiguous(out)
+    anchor_lens = maybe_contiguous(anchor_lens)
+    window_size_left, window_size_right = window_size
+    if window_size_left < -1 or window_size_right < -1:
+        raise ValueError(f"Invalid window_size={window_size}; values must be >= -1")
+    if anchored_window < 0:
+        raise ValueError("anchored_window must be non-negative")
+    if (anchored_window > 0) != (anchor_lens is not None):
+        raise ValueError(
+            "anchor_lens and a positive anchored_window must be provided together"
+        )
+
+    q_ = q.permute(0, 2, 1, 3).contiguous()
+    out_ = out.permute(0, 2, 1, 3).contiguous() if out is not None else None
+
+    out_ = glm_attn_v100_cuda.prefill_paged_fwd(
+        q_,
+        k_cache,
+        v_cache,
+        out_,
+        block_table,
+        seq_lens,
+        softmax_scale,
+        kv_cache_dtype,
+        float(k_scale),
+        float(v_scale),
+        causal,
+        int(window_size_left),
+        int(window_size_right),
+        anchor_lens,
+        int(anchored_window),
+    )
+    return _copy_bhmd_to_bmhd_out(out_, out_original)
+
+
+# Advertise the packaged direct-output ABI to the attention backend. Older
+# extension builds keep their existing single-request publication path.
+flash_attn_prefill_paged._sm70_dflash2_direct_bmhd = hasattr(
+    glm_attn_v100_cuda, "dflash2_paged_bmhd_fwd"
+)
+flash_attn_prefill_paged._sm70_dflash2_split_pages = (832, 1024, 1648, 2048)
+
+
+def fp8_e4m3_paged_kv_to_fp16(
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    seq_lens: torch.Tensor,
+    key_out: torch.Tensor,
+    value_out: torch.Tensor,
+    k_scale: float = 1.0,
+    v_scale: float = 1.0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Expand explicit E4M3 bytes; this does not enable a backend route.
+
+    Positive sequence lengths and physical block IDs must be within the
+    supplied cache/table capacity. Only the live prefix and its 16-token
+    padding are written; the remaining workspace is untouched.
+    """
+    op = getattr(glm_attn_v100_cuda, "fp8_e4m3_paged_kv_to_fp16", None)
+    if op is None:
+        raise RuntimeError("Rebuild Flash-V100 for the explicit E4M3 KV bridge")
+    op(
+        key_cache,
+        value_cache,
+        block_table.contiguous(),
+        seq_lens.contiguous(),
+        key_out,
+        value_out,
+        float(k_scale),
+        float(v_scale),
+    )
+    return key_out, value_out
+
+
+def fp8_e5m2_paged_kv_to_fp16(
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    seq_lens: torch.Tensor,
+    key_out: torch.Tensor,
+    value_out: torch.Tensor,
+    k_scale: float = 1.0,
+    v_scale: float = 1.0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Expand paged E5M2 K/V into preallocated FP16 paged workspaces."""
+    glm_attn_v100_cuda.fp8_e5m2_paged_kv_to_fp16(
+        key_cache,
+        value_cache,
+        maybe_contiguous(block_table),
+        maybe_contiguous(seq_lens),
+        key_out,
+        value_out,
+        float(k_scale),
+        float(v_scale),
+    )
+    return key_out, value_out
+
+
+def flash_attn_prefill_paged_bfla(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    seq_lens: torch.Tensor,
+    bfla_block_mask: torch.Tensor,
+    bfla_mask_block_n: int,
+    softmax_scale: float | None = None,
+    out: torch.Tensor | None = None,
+    kv_cache_dtype: str = "auto",
+    k_scale: float = 1.0,
+    v_scale: float = 1.0,
+    causal: bool = True,
+    window_size: tuple = (-1, -1),
+):
+    if softmax_scale is None:
+        softmax_scale = q.shape[-1] ** -0.5
+
+    out_original = out
+    q = maybe_contiguous(q)
+    block_table = maybe_contiguous(block_table)
+    seq_lens = maybe_contiguous(seq_lens)
+    bfla_block_mask = maybe_contiguous(bfla_block_mask)
+    out = maybe_contiguous(out)
+    window_size_left, window_size_right = window_size
+    if window_size_left < -1 or window_size_right < -1:
+        raise ValueError(f"Invalid window_size={window_size}; values must be >= -1")
+
+    q_ = q.permute(0, 2, 1, 3).contiguous()
+    out_ = out.permute(0, 2, 1, 3).contiguous() if out is not None else None
+
+    out_ = glm_attn_v100_cuda.prefill_paged_bfla_fwd(
+        q_,
+        k_cache,
+        v_cache,
+        out_,
+        block_table,
+        seq_lens,
+        bfla_block_mask,
+        int(bfla_mask_block_n),
+        softmax_scale,
+        kv_cache_dtype,
+        float(k_scale),
+        float(v_scale),
+        causal,
+        int(window_size_left),
+        int(window_size_right),
+    )
+    return _copy_bhmd_to_bmhd_out(out_, out_original)
+
+
+def flash_attn_prefill_paged_splitkv(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    seq_lens: torch.Tensor,
+    softmax_scale: float | None = None,
+    out: torch.Tensor | None = None,
+    kv_cache_dtype: str = "auto",
+    k_scale: float = 1.0,
+    v_scale: float = 1.0,
+    causal: bool = True,
+    window_size: tuple = (-1, -1),
+    split_kv_tokens: int = 32768,
+    max_seq_len_hint: int = 0,
+):
+    if softmax_scale is None:
+        softmax_scale = q.shape[-1] ** -0.5
+
+    out_original = out
+    q = maybe_contiguous(q)
+    block_table = maybe_contiguous(block_table)
+    seq_lens = maybe_contiguous(seq_lens)
+    out = maybe_contiguous(out)
+    window_size_left, window_size_right = window_size
+    if window_size_left < -1 or window_size_right < -1:
+        raise ValueError(f"Invalid window_size={window_size}; values must be >= -1")
+
+    q_ = q.permute(0, 2, 1, 3).contiguous()
+    out_ = out.permute(0, 2, 1, 3).contiguous() if out is not None else None
+
+    out_ = glm_attn_v100_cuda.prefill_paged_splitkv_fwd(
+        q_,
+        k_cache,
+        v_cache,
+        out_,
+        block_table,
+        seq_lens,
+        softmax_scale,
+        kv_cache_dtype,
+        float(k_scale),
+        float(v_scale),
+        causal,
+        int(window_size_left),
+        int(window_size_right),
+        int(split_kv_tokens),
+        int(max_seq_len_hint),
+    )
+    return _copy_bhmd_to_bmhd_out(out_, out_original)
+
+
+def flash_attn_prefill_paged_bhmd(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    seq_lens: torch.Tensor,
+    softmax_scale: float | None = None,
+    out: torch.Tensor | None = None,
+    kv_cache_dtype: str = "auto",
+    k_scale: float = 1.0,
+    v_scale: float = 1.0,
+    causal: bool = True,
+    window_size: tuple = (-1, -1),
+):
+    """Paged prefill entry for tensors already laid out as [B, H, M, D]."""
+    if softmax_scale is None:
+        softmax_scale = q.shape[-1] ** -0.5
+
+    q = maybe_contiguous(q)
+    block_table = maybe_contiguous(block_table)
+    seq_lens = maybe_contiguous(seq_lens)
+    out = maybe_contiguous(out)
+    window_size_left, window_size_right = window_size
+    if window_size_left < -1 or window_size_right < -1:
+        raise ValueError(f"Invalid window_size={window_size}; values must be >= -1")
+
+    return glm_attn_v100_cuda.prefill_paged_fwd(
+        q,
+        k_cache,
+        v_cache,
+        out,
+        block_table,
+        seq_lens,
+        softmax_scale,
+        kv_cache_dtype,
+        float(k_scale),
+        float(v_scale),
+        causal,
+        int(window_size_left),
+        int(window_size_right),
+        None,
+        0,
+    )
+
+
+def flash_attn_prefill_paged_d256_bm32_allp_pair_scratch(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    seq_lens: torch.Tensor,
+    softmax_scale: float | None = None,
+    out: torch.Tensor | None = None,
+    softmax_lse: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Run the fixed causal SM70 D256 BM32 ALL_P pair-scratch entry.
+
+    Q and out use contiguous [B, H, M, D] layout. The native entry rejects
+    unsupported shapes and CUDA graph capture rather than allocating or
+    selecting another implementation. Supplying out and softmax_lse avoids
+    output allocations for this call outside CUDA graph capture.
+    """
+    if softmax_scale is None:
+        softmax_scale = q.shape[-1] ** -0.5
+
+    out_result, lse_result = (
+        glm_attn_v100_cuda.prefill_paged_d256_bm32_allp_pair_scratch_fwd(
+            q,
+            k_cache,
+            v_cache,
+            out,
+            softmax_lse,
+            block_table,
+            seq_lens,
+            float(softmax_scale),
+        )
+    )
+    return out_result, lse_result
+
+
+def flash_attn_prefill_paged_d256_bm32_allp_pair_scratch_splitkv3(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    actual_n: int,
+    *,
+    softmax_scale: float | None = None,
+    out: torch.Tensor | None = None,
+    softmax_lse: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Run the fixed causal SM70 D256 BM32 three-way split-KV entry.
+
+    Q is a contiguous FP16 tensor in [B, H, M, D] layout. The per-stream
+    workspace and omitted outputs are reused for matching shapes.
+    """
+    if softmax_scale is None:
+        softmax_scale = q.shape[-1] ** -0.5
+
+    workspace = _get_prefill_splitkv3_workspace(q)
+    if out is None:
+        out = workspace.out
+    if softmax_lse is None:
+        softmax_lse = workspace.softmax_lse
+
+    out_result, lse_result = (
+        glm_attn_v100_cuda.prefill_paged_d256_bm32_allp_pair_scratch_splitkv3_fwd(
+            q,
+            k_cache,
+            v_cache,
+            out,
+            softmax_lse,
+            workspace.tmp_out,
+            workspace.row_max,
+            workspace.row_sum,
+            block_table,
+            int(actual_n),
+            float(softmax_scale),
+        )
+    )
+    return out_result, lse_result
+
+
+__all__ = [
+    "flash_attn_func",
+    "flash_attn_lse",
+    "flash_attn_qk_scores",
+    "flash_attn_decode_paged",
+    "flash_attn_decode_paged_xqa",
+    "flash_attn_decode_paged_xqa_available",
+    "flash_attn_grouped_verify_paged",
+    "flash_attn_grouped_e4m3_fp32_paged",
+    "flash_attn_grouped_e4m3_fp32_available",
+    "flash_attn_decode_paged_wmma",
+    "flash_attn_decode_qk_scores",
+    "flash_attn_turboquant_decode_paged",
+    "flash_attn_turboquant_decode_paged_available",
+    "flash_attn_prefill_paged",
+    "flash_attn_prefill_paged_d256_bm32_allp_pair_scratch",
+    "flash_attn_prefill_paged_d256_bm32_allp_pair_scratch_splitkv3",
+    "flash_attn_prefill_paged_bfla",
+    "flash_attn_prefill_paged_splitkv",
+    "flash_attn_prefill_paged_bhmd",
+]
