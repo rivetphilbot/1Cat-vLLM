@@ -40,6 +40,7 @@ MTPModelTypes = Literal[
     "mimo_v2_mtp",
     "glm4_moe_mtp",
     "glm4_moe_lite_mtp",
+    "glm5_next_mtp",
     "glm_ocr_mtp",
     "ernie_mtp",
     "nemotron_h_mtp",
@@ -538,6 +539,26 @@ class SpeculativeConfig:
                 {
                     "n_predict": n_predict,
                     "architectures": ["Glm4MoeMTPModel"],
+                }
+            )
+
+        if hf_config.architectures[0] in (
+            "Glm5NextForConditionalGeneration",
+            "Glm5NextForCausalLM",
+        ):
+            # GLM-5.3-Flash: one NEXTN layer (layers.45) after the 45 backbone layers. The multimodal
+            # config nests the text settings under text_config; the MTP class reads them from the top level.
+            text_cfg = getattr(hf_config, "text_config", None)
+            if text_cfg is not None:
+                for key, value in (text_cfg.to_dict() if hasattr(text_cfg, "to_dict") else dict(text_cfg)).items():
+                    if not hasattr(hf_config, key) or key in ("num_hidden_layers", "vocab_size", "hidden_size"):
+                        setattr(hf_config, key, value)
+            hf_config.model_type = "glm5_next_mtp"
+            n_predict = getattr(hf_config, "num_nextn_predict_layers", None)
+            hf_config.update(
+                {
+                    "n_predict": n_predict,
+                    "architectures": ["Glm5NextMTPModel"],
                 }
             )
 
