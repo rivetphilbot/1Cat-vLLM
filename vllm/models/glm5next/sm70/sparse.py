@@ -42,6 +42,13 @@ _DEBUG_DFLASH_SPARSE_INDICES = bool(
 )
 _DFLASH_SPARSE_INDICES_SEEN = False
 _FP8_GEMM_MAX_TOKENS = 8
+# Opt-in: route FP8-KV decode/verify (<= _FP8_GEMM_MAX_TOKENS tokens) through glm-attn-v100, which keeps
+# scores and softmax in FP32 instead of the FP16 score buffers of the GEMM routes below.
+_USE_GLM_ATTN_V100 = bool(int(os.getenv("VLLM_GLM_ATTN_V100", "0")))
+try:
+    from glm_attn_v100 import glm_sparse_mla as _glm_attn_v100
+except ImportError:
+    _glm_attn_v100 = None
 
 
 class Glm5NextSM70SparseBackend(FlashMLASparseBackend):
@@ -185,6 +192,35 @@ class Glm5NextSM70SparseImpl(SparseMLAAttentionImpl[FlashMLASparseMetadata]):
                     ),
                 )
             )
+        self.use_glm_attn_v100 = _USE_GLM_ATTN_V100 and self.use_fp8_cache
+        if self.use_glm_attn_v100:
+            if _glm_attn_v100 is None:
+                raise ImportError(
+                    "VLLM_GLM_ATTN_V100=1 but glm_attn_v100 (glm-attn-v100/) is not built."
+                )
+            if num_heads % _glm_attn_v100.HEADS_PER_CTA != 0:
+                raise NotImplementedError(
+                    "glm-attn-v100 sparse MLA needs a multiple of 16 heads per rank, "
+                    f"got {num_heads}."
+                )
+            self.glm_attn_splits = _glm_attn_v100.default_num_splits(self.index_width)
+            workspace_specs.extend(
+                (
+                    (
+                        (
+                            self.fp8_gemm_max_tokens,
+                            num_heads,
+                            self.glm_attn_splits,
+                            self.kv_lora_rank,
+                        ),
+                        torch.float32,
+                    ),
+                    (
+                        (self.fp8_gemm_max_tokens, num_heads, self.glm_attn_splits, 2),
+                        torch.float32,
+                    ),
+                )
+            )
         current_workspace_manager().get_simultaneous(*workspace_specs)
         logger.info_once(
             "GLM-5.3-Flash route: SM70 FP16 sparse MLA with %s KV%s.",
@@ -293,6 +329,30 @@ class Glm5NextSM70SparseImpl(SparseMLAAttentionImpl[FlashMLASparseMetadata]):
                 )
                 _DFLASH_SPARSE_INDICES_SEEN = True
         workspace_manager = current_workspace_manager()
+        if (
+            self.use_glm_attn_v100
+            and self.use_fp8_cache
+            and num_tokens <= self.fp8_gemm_max_tokens
+        ):
+            out, o_part, ml = workspace_manager.get_simultaneous(
+                ((num_tokens, self.num_heads, self.kv_lora_rank), torch.float16),
+                (
+                    (num_tokens, self.num_heads, self.glm_attn_splits, self.kv_lora_rank),
+                    torch.float32,
+                ),
+                ((num_tokens, self.num_heads, self.glm_attn_splits, 2), torch.float32),
+            )
+            _glm_attn_v100.sparse_mla_fp8(
+                q,
+                kv_c_and_k_pe_cache.view(torch.uint8),
+                global_indices.reshape(num_tokens, -1),
+                valid_counts.reshape(-1),
+                self.softmax_scale,
+                out=out,
+                num_splits=self.glm_attn_splits,
+                workspace=(o_part, ml),
+            )
+            return out, None
         if self.use_fp8_cache:
             if num_tokens == 1:
                 out, gathered_kv, scores, probs = workspace_manager.get_simultaneous(

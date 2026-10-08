@@ -46,6 +46,8 @@ def sparse_mla_fp8(
     if workspace is None:
         workspace = alloc_workspace(q.shape[0], q.shape[1], num_splits, q.device)
     o_part, ml = workspace
+    if q.stride(-1) != 1 or q.stride(1) % 8 or q.stride(0) % 8 or q.data_ptr() % 16:
+        q = q.contiguous()  # the kernel loads 16-byte query vectors
     _C.sparse_mla_fp8_fwd(
         q, cache, indices, lengths.reshape(-1), float(scale), out, o_part, ml, num_splits
     )
