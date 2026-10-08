@@ -83,6 +83,16 @@ def get_ext_modules():
                 ],
             },
         ),
+        # GLM-5.3 sparse MLA (kernel/glm_sparse_mla.cu). No --use_fast_math: this kernel exists for
+        # FP32 softmax accuracy, so expf stays IEEE-accurate.
+        CUDAExtension(
+            name="glm_sparse_mla_cuda",
+            sources=["kernel/glm_sparse_mla.cu"],
+            extra_compile_args={
+                "cxx": ["-O3", "-std=c++17"],
+                "nvcc": ["-O3", "-std=c++17", *_volta_gencode_flags()],
+            },
+        ),
     ]
 
 
