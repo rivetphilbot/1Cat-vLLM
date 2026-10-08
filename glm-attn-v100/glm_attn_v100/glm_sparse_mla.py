@@ -14,9 +14,13 @@ HEADS_PER_CTA = 16
 KEYS_PER_TILE = 32
 
 
-def default_num_splits(index_width: int) -> int:
-    """One CTA per 128 selected keys (16 CTAs for the 2048-key DSA top-k)."""
-    return max(1, min(64, -(-index_width // 128)))
+def default_num_splits(index_width: int, num_tokens: int = 1) -> int:
+    """About 64 CTAs per 16-head group: 64 splits for decode, 16 for 4 tokens, 8 for 8 tokens.
+
+    Measured on V100 (16 heads, 2048 keys): T=1 45.8 us at 64 splits vs 74.5 at 16; T=4 87 us at 16;
+    T=8 161 us at 8-16. Never more splits than 32-key tiles."""
+    target = max(1, 64 // max(1, num_tokens))
+    return max(1, min(target, -(-index_width // KEYS_PER_TILE)))
 
 
 def alloc_workspace(num_tokens: int, num_heads: int, num_splits: int, device) -> tuple:

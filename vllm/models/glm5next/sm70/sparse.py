@@ -203,22 +203,15 @@ class Glm5NextSM70SparseImpl(SparseMLAAttentionImpl[FlashMLASparseMetadata]):
                     "glm-attn-v100 sparse MLA needs a multiple of 16 heads per rank, "
                     f"got {num_heads}."
                 )
-            self.glm_attn_splits = _glm_attn_v100.default_num_splits(self.index_width)
+            # Split count depends on the token count; reserve the largest tokens x splits product.
+            max_rows = max(
+                t * _glm_attn_v100.default_num_splits(self.index_width, t)
+                for t in range(1, self.fp8_gemm_max_tokens + 1)
+            )
             workspace_specs.extend(
                 (
-                    (
-                        (
-                            self.fp8_gemm_max_tokens,
-                            num_heads,
-                            self.glm_attn_splits,
-                            self.kv_lora_rank,
-                        ),
-                        torch.float32,
-                    ),
-                    (
-                        (self.fp8_gemm_max_tokens, num_heads, self.glm_attn_splits, 2),
-                        torch.float32,
-                    ),
+                    ((max_rows, num_heads, self.kv_lora_rank), torch.float32),
+                    ((max_rows, num_heads, 2), torch.float32),
                 )
             )
         current_workspace_manager().get_simultaneous(*workspace_specs)
@@ -334,13 +327,14 @@ class Glm5NextSM70SparseImpl(SparseMLAAttentionImpl[FlashMLASparseMetadata]):
             and self.use_fp8_cache
             and num_tokens <= self.fp8_gemm_max_tokens
         ):
+            splits = _glm_attn_v100.default_num_splits(self.index_width, num_tokens)
             out, o_part, ml = workspace_manager.get_simultaneous(
                 ((num_tokens, self.num_heads, self.kv_lora_rank), torch.float16),
                 (
-                    (num_tokens, self.num_heads, self.glm_attn_splits, self.kv_lora_rank),
+                    (num_tokens, self.num_heads, splits, self.kv_lora_rank),
                     torch.float32,
                 ),
-                ((num_tokens, self.num_heads, self.glm_attn_splits, 2), torch.float32),
+                ((num_tokens, self.num_heads, splits, 2), torch.float32),
             )
             _glm_attn_v100.sparse_mla_fp8(
                 q,
@@ -349,7 +343,7 @@ class Glm5NextSM70SparseImpl(SparseMLAAttentionImpl[FlashMLASparseMetadata]):
                 valid_counts.reshape(-1),
                 self.softmax_scale,
                 out=out,
-                num_splits=self.glm_attn_splits,
+                num_splits=splits,
                 workspace=(o_part, ml),
             )
             return out, None
