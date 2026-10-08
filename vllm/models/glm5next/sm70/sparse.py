@@ -219,7 +219,11 @@ class Glm5NextSM70SparseImpl(SparseMLAAttentionImpl[FlashMLASparseMetadata]):
             "GLM-5.3-Flash route: SM70 FP16 sparse MLA with %s KV%s.",
             "packed E4M3FN" if self.use_fp8_cache else "FP16",
             (
-                " and B1/M2-M8 dequant + tensor-core GEMM decode"
+                (
+                    " and glm-attn-v100 FP32-softmax decode/verify (VLLM_GLM_ATTN_V100=1)"
+                    if self.use_glm_attn_v100
+                    else " and B1/M2-M8 dequant + tensor-core GEMM decode"
+                )
                 if self.use_fp8_cache
                 else ""
             ),
