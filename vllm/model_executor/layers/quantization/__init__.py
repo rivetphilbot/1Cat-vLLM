@@ -35,6 +35,7 @@ QuantizationMethods = Literal[
     "gpt_oss_mxfp4",
     "deepseek_v4_fp8",
     "online",
+    "exl3",
     # Below are online quant shorthand names (see vllm.config.quantization).
     # Listed here as strings to avoid a circular import; kept in sync with
     # _ONLINE_SHORTHANDS by the assertion in get_quantization_config().
@@ -194,9 +195,11 @@ def get_quantization_config(quantization: str) -> type[QuantizationConfig]:
     from .mxfp4 import GptOssMxfp4Config, Mxfp4Config
     from .online.base import OnlineQuantizationConfig
     from .torchao import TorchAOConfig
+    from .exl3 import Exl3Config
 
     method_to_config: dict[str, type[QuantizationConfig]] = {
         "awq": AWQConfig,
+        "exl3": Exl3Config,
         "fp8": Fp8Config,
         "fbgemm_fp8": FBGEMMFp8Config,
         "fp_quant": FPQuantConfig,
