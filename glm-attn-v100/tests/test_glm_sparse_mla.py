@@ -141,7 +141,7 @@ def main():
         dict(name="decode splits=64", T=1, H=16, W=2048, n_cache=4096, lengths=[2048], q_std=0.05, kv_std=1.0, num_splits=64),
         dict(name="sharp attention (big logits)", T=2, H=16, W=2048, n_cache=4096, lengths=[2048, 2048], q_std=0.6, kv_std=1.0),
         dict(name="large logits (FP16 score precision)", T=2, H=16, W=2048, n_cache=4096, lengths=[2048, 2048], q_std=4.0, kv_std=2.0),
-        dict(name="extreme (old FP16 scores overflow)", T=1, H=16, W=2048, n_cache=4096, lengths=[2048], q_std=200.0, kv_std=2.0),
+        dict(name="extreme (old FP16 scores overflow)", T=1, H=16, W=2048, n_cache=4096, lengths=[2048], q_std=300.0, kv_std=2.0),
         dict(name="block_size 16, width 512", T=3, H=16, W=512, n_cache=1000, lengths=[512, 400, 1], q_std=0.1, kv_std=1.0, block_size=16),
     ]
     for c in cases:
