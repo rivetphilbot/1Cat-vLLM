@@ -8,7 +8,9 @@ from typing import ClassVar, Literal
 import torch
 from torch import nn
 
+import vllm._sm70_ops as sm70_ops
 from vllm.config import ParallelConfig, VllmConfig
+from vllm.config.execution_policy import layer_policy
 from vllm.config.sm70_runtime import capture_runtime_trace, target_trace_min_position
 from vllm.diagnostics import diagnostic_channel, diagnostic_history, diagnostics_for
 from vllm.distributed import (
@@ -172,6 +174,30 @@ def _debug_dflash_target_trace(
         )
 
 
+def _sm70_small_n_gemv_enabled() -> bool:
+    """Unset policy (provenance "default") takes the native small-N GEMV."""
+    policy = layer_policy()
+    sources = getattr(policy, "sources", {})
+    if sources.get("glm_small_n_gemv", "default") == "default":
+        return True
+    return bool(policy.glm_small_n_gemv)
+
+
+def _sm70_small_n_gemv_ok(x: torch.Tensor, weight: torch.Tensor) -> bool:
+    return (
+        1 <= x.shape[0] <= 8
+        and x.dtype == torch.float16
+        and weight.dtype == torch.float16
+        and x.is_contiguous()
+        and weight.is_contiguous()
+        and weight.ndim == 2
+        and weight.shape[1] == x.shape[1]
+        and weight.shape[0] % 32 == 0
+        and weight.shape[1] % 64 == 0
+        and hasattr(torch.ops._C, "sm70_glm53_small_n_gemv_out")
+    )
+
+
 def _get_moe_router_dtype(config: Glm5NextConfig) -> torch.dtype | None:
     if getattr(config, "moe_router_dtype", None) == "float32":
         return torch.float32
@@ -223,8 +249,38 @@ class Glm5NextMLP(nn.Module):
             self.act_fn = SiluAndMulWithClamp(swiglu_limit=self.swiglu_limit)
         else:
             self.act_fn = SiluAndMul()
+        self._use_sm70_small_n_gemv = (
+            current_platform.is_cuda()
+            and current_platform.get_device_capability() == (7, 0)
+            and self.gate_up_proj.bias is None
+            and self.down_proj.bias is None
+            # The shared experts are built with reduce_results=False (the MoE
+            # runner reduces once); a reducing MLP keeps the standard path.
+            and not self.down_proj.reduce_results
+        )
 
     def forward(self, x):
+        if (
+            self._use_sm70_small_n_gemv
+            and _sm70_small_n_gemv_enabled()
+            and _sm70_small_n_gemv_ok(x, self.gate_up_proj.weight)
+            and self.down_proj.weight.dtype == torch.float16
+            and self.down_proj.weight.is_contiguous()
+            and self.down_proj.weight.shape[0] % 32 == 0
+            and self.down_proj.weight.shape[1] % 64 == 0
+        ):
+            # 1-8 token decode: cuBLAS split-Ks these small-N shapes into
+            # 100-200 GB/s; the native m8n8k4 GEMV streams them at 500+.
+            w1, w2 = self.gate_up_proj.weight, self.down_proj.weight
+            gate_up = torch.empty(
+                (x.shape[0], w1.shape[0]), dtype=x.dtype, device=x.device
+            )
+            sm70_ops.sm70_glm53_small_n_gemv_out(gate_up, x, w1)
+            h = self.act_fn(gate_up)
+            out = torch.empty((x.shape[0], w2.shape[0]), dtype=x.dtype, device=x.device)
+            sm70_ops.sm70_glm53_small_n_gemv_out(out, h, w2)
+            logger.info_once("SM70 GLM shared-expert MLP native small-N GEMV enabled.")
+            return out
         gate_up, _ = self.gate_up_proj(x)
         x = self.act_fn(gate_up)
         x, _ = self.down_proj(x)
@@ -266,6 +322,12 @@ class Glm5NextMoE(nn.Module):
             config.n_routed_experts,
             out_dtype=self.router_dtype,
             prefix=f"{prefix}.gate",
+        )
+        self._use_sm70_small_n_gemv_router = (
+            current_platform.is_cuda()
+            and current_platform.get_device_capability() == (7, 0)
+            and self.gate.bias is None
+            and self.gate.out_dtype in (None, torch.float16, torch.float32)
         )
         if getattr(config, "topk_method", None) == "noaux_tc":
             self.gate.e_score_correction_bias = nn.Parameter(
@@ -344,7 +406,24 @@ class Glm5NextMoE(nn.Module):
 
         # The router is always external (self.gate); main's MoERunner expects
         # pre-computed router_logits, so compute them here unconditionally.
-        router_logits, _ = self.gate(hidden_states)
+        if (
+            self._use_sm70_small_n_gemv_router
+            and _sm70_small_n_gemv_enabled()
+            and _sm70_small_n_gemv_ok(hidden_states, self.gate.weight)
+        ):
+            # Router logits straight from the FP32 accumulator, no FP16
+            # round trip and no cast kernel.
+            router_logits = torch.empty(
+                (hidden_states.shape[0], self.gate.weight.shape[0]),
+                dtype=self.gate.out_dtype or hidden_states.dtype,
+                device=hidden_states.device,
+            )
+            sm70_ops.sm70_glm53_small_n_gemv_out(
+                router_logits, hidden_states, self.gate.weight
+            )
+            logger.info_once("SM70 GLM router native small-N GEMV enabled.")
+        else:
+            router_logits, _ = self.gate(hidden_states)
         final_hidden_states = self.experts(
             hidden_states=hidden_states, router_logits=router_logits
         )

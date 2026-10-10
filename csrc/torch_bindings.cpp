@@ -882,6 +882,11 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
            vllm::sm70::with_policy(&sm70_f16_gemm_out));
 
   ops.def(
+      "sm70_glm53_small_n_gemv_out(Tensor(a!) y, Tensor x, Tensor w) -> ()");
+  ops.impl("sm70_glm53_small_n_gemv_out", torch::kCUDA,
+           &sm70_glm53_small_n_gemv_out);
+
+  ops.def(
       "sm70_glm_mhc_pre_norm_out("
       "Tensor gemm_mul, Tensor gemm_sqrsum, Tensor hc_scale, Tensor hc_base, "
       "Tensor residual, Tensor(a!) post_mix, Tensor(b!) comb_mix, "

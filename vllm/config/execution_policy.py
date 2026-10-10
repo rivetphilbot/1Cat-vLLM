@@ -481,6 +481,7 @@ class LayerExecutionPolicy(ExecutionPolicy):
     """Allow the qualified fused recurrent gate projection."""
 
     mhc_native_verify: bool | None = None
+    glm_small_n_gemv: bool | None = None
     """Use the native eight-token hyperconnection normalization."""
 
     mhc_fused_post_dot: bool | None = None
@@ -535,6 +536,7 @@ class LayerExecutionPolicy(ExecutionPolicy):
         "glm_cublaslt": "VLLM_SM70_GLM53_TP8_CUBLASLT",
         "glm_fused_fg_b": "VLLM_SM70_GLM53_TP8_FUSED_FG_B",
         "mhc_native_verify": "VLLM_SM70_GLM53_MHC_NATIVE_VERIFY",
+        "glm_small_n_gemv": "VLLM_SM70_GLM53_SMALL_N_GEMV",
         "mhc_fused_post_dot": "VLLM_SM70_GLM53_MHC_FUSED_POST_DOT_Q8",
         "mhc_pre_threads": "VLLM_SM70_GLM_MHC_PRE_THREADS",
     }

@@ -416,6 +416,9 @@ void sm70_f16_rerank_topk_out(torch::Tensor values_out, torch::Tensor ids_out,
                               torch::Tensor logits, torch::Tensor candidate_ids,
                               int64_t vocab_start_index);
 
+void sm70_glm53_small_n_gemv_out(torch::Tensor y, torch::Tensor x,
+                                 torch::Tensor w);
+
 void sm70_glm_mhc_pre_norm_out(
     torch::Tensor gemm_mul, torch::Tensor gemm_sqrsum, torch::Tensor hc_scale,
     torch::Tensor hc_base, torch::Tensor residual, torch::Tensor post_mix,

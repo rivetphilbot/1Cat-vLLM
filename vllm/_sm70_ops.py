@@ -94,6 +94,7 @@ from vllm._sm70.linear import (
     sm70_gemm_export_cache,
     sm70_gemm_import_cache,
     sm70_glm53_fp16_gemv_out,
+    sm70_glm53_small_n_gemv_out,
     sm70_glm53_tp8_cublaslt_out,
     uint4_sm70_prepare,
 )
@@ -253,6 +254,7 @@ __all__ = [
     "sm70_gemm_export_cache",
     "sm70_gemm_import_cache",
     "sm70_glm53_fp16_gemv_out",
+    "sm70_glm53_small_n_gemv_out",
     "sm70_glm53_tp8_cublaslt_out",
     "uint4_sm70_prepare",
     "_maybe_load_fp8_qpn8_library",

@@ -17623,6 +17623,22 @@ environment_variables: dict[str, Callable[[], Any]] = {
         acceleration_paths=("Gated DeltaNet",),
         user_visible=False,
     ),
+    "VLLM_SM70_GLM53_SMALL_N_GEMV": env_var(
+        lambda: os.getenv("VLLM_SM70_GLM53_SMALL_N_GEMV"),
+        description=(
+            "GLM-5.3 on SM70: route the router gate and the shared-expert MLP "
+            "projections of 1-8 token batches through the native tensor-core "
+            "small-N GEMV (FP32 logits written directly). Unset: on."
+        ),
+        category="configuration",
+        declared_default="None",
+        effective_default="None (the decode path takes the native op when unset)",
+        automatic_conditions=(
+            ("vllm/models/glm5next/nvidia/model.py:_sm70_small_n_gemv_enabled"),
+        ),
+        acceleration_paths=("SM70 FP16 linear",),
+        user_visible=False,
+    ),
     "VLLM_SM70_GLM53_EXACT_KDA_GEMV": env_var(
         lambda: os.getenv("VLLM_SM70_GLM53_EXACT_KDA_GEMV"),
         description="Select the exact GLM-5.3 KDA GEMV implementation.",

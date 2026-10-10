@@ -2057,6 +2057,21 @@ if hasattr(torch.ops._C, "sm70_glm53_fp16_gemv_out"):
         return None
 
 
+def sm70_glm53_small_n_gemv_out(
+    y: torch.Tensor, x: torch.Tensor, w: torch.Tensor
+) -> None:
+    _op("sm70_glm53_small_n_gemv_out")(y, x, w)
+
+
+if hasattr(torch.ops._C, "sm70_glm53_small_n_gemv_out"):
+
+    @register_fake("_C::sm70_glm53_small_n_gemv_out")
+    def _sm70_glm53_small_n_gemv_out_fake(
+        y: torch.Tensor, x: torch.Tensor, w: torch.Tensor
+    ) -> None:
+        return None
+
+
 def sm70_gemm_import_cache(
     device_hint: torch.Tensor, path: str, native_policy: tuple[str, ...] = ()
 ) -> int:
