@@ -184,7 +184,7 @@ dill==0.3.8
     #   multiprocess
 distlib==0.3.9
     # via virtualenv
-dnspython==2.7.0
+dnspython==2.9.0
     # via email-validator
 docker==7.1.0
     # via
